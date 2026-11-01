@@ -1329,6 +1329,11 @@ button { cursor: pointer; }
     prevTargets: {},       // 各構圖上一次的目標點（讓目標保持穩定）
     okLatched: false,      // 「構圖到位」狀態（加遲滯，避免一直閃）
     lostAt: -1e9,
+    frozen: null,          // 選定構圖的固定目標：{ id, kind, target, horizonTarget }
+    jump: 0,               // 自動主體突然跳到別處的連續次數
+    disp: null,            // 畫面上實際繪製的位置（逐格平滑）
+    dir: { axis: null },   // 目前提示的方向（加遲滯，避免左右來回）
+    chipIds: '',
   };
 
   // ---------- 示範場景（程式繪製，不需外部圖片） ----------
@@ -1446,6 +1451,7 @@ button { cursor: pointer; }
     state.smooth = null;
     state.selectedId = null;
     state.prevTargets = {};
+    state.lastChipRender = 0;
     setLock(null);
     els.srcTag.textContent = label;
     els.camToggle.hidden = !state.cameraOk;
@@ -1573,8 +1579,18 @@ button { cursor: pointer; }
     opts.faces = faces;
     state.lastGray = data;
     const a = E.analyze(data, opts);
+    // 自動偵測的主體突然跳到很遠的地方：要連續出現約 1 秒才採用，否則沿用原本的主體
+    if (!isStill && state.smooth && !a.subject.kind && !state.smooth.subject.kind) {
+      const ps = state.smooth.subject;
+      if (Math.hypot(a.subject.cx - ps.cx, a.subject.cy - ps.cy) > 0.15) {
+        state.jump++;
+        if (state.jump < 5) a.subject = Object.assign({}, ps, { box: Object.assign({}, ps.box) });
+        else { state.jump = 0; state.frozen = null; }
+      } else state.jump = 0;
+    }
     if (!isStill && state.smooth && state.smooth.subject.kind === a.subject.kind) {
-      const k = 0.35, s = state.smooth, n = a.subject;
+      // 追蹤中的主體（人臉、點選）本身就準，平滑少一點；自動偵測的主體平滑多一點
+      const k = a.subject.kind ? 0.5 : 0.25, s = state.smooth, n = a.subject;
       const lerp = (p, q) => p + (q - p) * k;
       n.cx = lerp(s.subject.cx, n.cx); n.cy = lerp(s.subject.cy, n.cy);
       n.box = { x: lerp(s.subject.box.x, n.box.x), y: lerp(s.subject.box.y, n.box.y), w: lerp(s.subject.box.w, n.box.w), h: lerp(s.subject.box.h, n.box.h) };
@@ -1589,10 +1605,36 @@ button { cursor: pointer; }
     state.analysis = a;
     const comps = E.suggest(a, { prev: state.prevTargets });
     for (const c of comps) state.prevTargets[c.id] = c.pick;
-    state.comps = comps;
-    if (!state.selectedId || !comps.find((c) => c.id === state.selectedId)) state.selectedId = comps[0] && comps[0].id;
     const now = performance.now();
-    if (isStill || now - state.lastChipRender > 1200) { renderChips(); state.lastChipRender = now; }
+    // 選中的構圖暫時從清單消失時（分數邊界），2.5 秒內沿用它，不要自動換掉
+    let cur = comps.find((c) => c.id === state.selectedId);
+    if (!cur && state.selSnap && state.selSnap.id === state.selectedId && now - state.selSnap.at < 2500 && !isStill) {
+      cur = Object.assign({}, state.selSnap.comp);
+      comps.push(cur);
+    }
+    if (!cur) { state.selectedId = comps[0] && comps[0].id; cur = comps[0]; state.frozen = null; }
+    if (cur) {
+      // 固定目標：同一個構圖選定後，目標點不再跟著主體跳動
+      const S = a.subject;
+      if (!state.frozen || state.frozen.id !== cur.id || state.frozen.kind !== (S.kind || 'auto')) {
+        state.frozen = { id: cur.id, kind: S.kind || 'auto', target: cur.target, horizonTarget: cur.horizonTarget, reason: cur.reason };
+      }
+      const F = state.frozen;
+      cur.target = F.target;
+      cur.reason = F.reason; // 說明文字要和固定的目標一致
+      if (F.horizonTarget != null) cur.horizonTarget = F.horizonTarget;
+      const hz = cur.guide === 'horizon' || cur.guide === 'reflection';
+      const from = hz ? { x: 0.5, y: a.horizon.y } : { x: S.cx, y: S.cy };
+      const to = hz ? { x: 0.5, y: cur.horizonTarget } : (cur.guide === 'fill' ? { x: 0.5, y: 0.5 } : cur.target);
+      cur.aim = E.aimHint(from, to, S, cur.size);
+      if (comps.includes(cur)) state.selSnap = { id: cur.id, comp: cur, at: now };
+    }
+    state.comps = comps;
+    // 建議清單：只在「有哪些構圖」改變時才重排，而且至少間隔 3 秒，避免一直跳
+    const ids = comps.slice(0, 5).map((c) => c.id).join(',');
+    if (isStill || (ids !== state.chipIds && now - state.lastChipRender > 3000) || !state.lastChipRender) {
+      renderChips(); state.lastChipRender = now; state.chipIds = ids;
+    }
     renderDetail();
     renderReadout();
   }
@@ -1657,6 +1699,8 @@ button { cursor: pointer; }
     els.howto.hidden = !!L;
     state.prevTargets = {};
     state.okLatched = false;
+    state.frozen = null;
+    state.disp = null;
   }
   function lostLock() {
     setLock(null);
@@ -1721,7 +1765,7 @@ button { cursor: pointer; }
       const bar = document.createElement('span'); bar.className = 'bar';
       const fill = document.createElement('i'); fill.style.width = c.score + '%'; bar.appendChild(fill);
       b.append(nm, sc, bar);
-      b.addEventListener('click', () => { state.selectedId = c.id; state.okLatched = false; renderChips(); renderDetail(); });
+      b.addEventListener('click', () => { state.selectedId = c.id; state.okLatched = false; state.frozen = null; state.dir.axis = null; renderChips(); renderDetail(); analyzeNow(state.source === 'still'); });
       els.chips.appendChild(b);
     }
   }
@@ -1729,7 +1773,7 @@ button { cursor: pointer; }
   function renderDetail() {
     const c = selected();
     if (!c) return;
-    els.detailTitle.textContent = `${c.name}　適合度 ${c.score}`;
+    els.detailTitle.textContent = c.name;
     els.reason.textContent = c.reason;
     els.tips.textContent = '';
     for (const t of c.tips) { const li = document.createElement('li'); li.textContent = t; els.tips.appendChild(li); }
@@ -1755,8 +1799,9 @@ button { cursor: pointer; }
     const dpr = W / els.stage.clientWidth;
     let T; // 畫面座標（0..1）→ 畫布像素
     const mirror = state.source === 'live' && state.facing === 'user';
+    smoothDisplay(c, a);
     if (state.mode === 'crop' && c) {
-      const k = c.crop;
+      const k = state.disp ? state.disp.crop : c.crop;
       drawSrc(src, k.x * sw, k.y * sh, k.w * sw, k.h * sh, W, H, mirror);
       T = (p) => ({ x: mx((p.x - k.x) / k.w) * W, y: (p.y - k.y) / k.h * H });
     } else {
@@ -1783,178 +1828,98 @@ button { cursor: pointer; }
     ctx.strokeStyle = color; ctx.lineWidth = width; ctx.setLineDash(dash || []); ctx.stroke(); ctx.setLineDash([]);
   }
 
-  function label(text, x, y, color, dpr) {
-    ctx.font = `500 ${12 * dpr}px "Noto Sans TC", system-ui, sans-serif`;
-    const tw = ctx.measureText(text).width;
-    ctx.fillStyle = 'rgba(10,9,8,0.62)';
-    ctx.fillRect(x - 4 * dpr, y - 13 * dpr, tw + 8 * dpr, 18 * dpr);
-    ctx.fillStyle = color; ctx.fillText(text, x, y);
+  /*
+   * 畫面上實際畫的點（主體黃點、目標圓圈、裁切框）每一格往最新的分析結果靠近，
+   * 分析一秒只有約 4 次，直接畫會一頓一頓地跳。
+   */
+  function smoothDisplay(c, a) {
+    if (!c || !a) return;
+    const S = a.subject;
+    const hz = c.guide === 'horizon' || c.guide === 'reflection';
+    const from = hz ? { x: 0.5, y: a.horizon.y } : { x: S.cx, y: S.cy };
+    const to = hz ? { x: 0.5, y: c.horizonTarget } : (c.guide === 'fill' ? { x: 0.5, y: 0.5 } : c.target);
+    const now = performance.now();
+    if (!state.disp || state.disp.id !== c.id || state.source === 'still') {
+      state.disp = { id: c.id, from: { ...from }, to: { ...to }, crop: { ...c.crop }, t: now };
+      return;
+    }
+    const D = state.disp;
+    const dt = Math.min(0.1, (now - D.t) / 1000); D.t = now;
+    const k = 1 - Math.exp(-dt / 0.15);
+    const ease = (p, q) => { p.x += (q.x - p.x) * k; p.y += (q.y - p.y) * k; };
+    ease(D.from, from); ease(D.to, to);
+    for (const key of ['x', 'y', 'w', 'h']) D.crop[key] += (c.crop[key] - D.crop[key]) * k;
   }
 
+  /*
+   * 疊在取景畫面上的東西刻意只有三樣：淡淡的參考線、目標圓圈、主體黃點。
+   * 移動方向只在上方的提示文字說一次。水平線歪掉時才另外畫出實際的水平線。
+   */
   function drawOverlay(c, a, T, W, H, dpr) {
-    const lw = 1.2 * dpr;
+    const lw = 1 * dpr;
     const inCrop = state.mode === 'crop';
-    // 參考線（以目前顯示的畫框為準）
-    const gx = (f) => f * W, gy = (f) => f * H;
+    const faint = 'rgba(255,255,255,0.32)';
+    const vline = (f) => line(f * W, 0, f * W, H, faint, lw);
+    const hline = (f) => line(0, f * H, W, f * H, faint, lw);
     switch (c.guide) {
-      case 'thirds':
-      case 'space':
-        for (const f of [1 / 3, 2 / 3]) { line(gx(f), 0, gx(f), H, COL.guide, lw); line(0, gy(f), W, gy(f), COL.guide, lw); }
-        break;
-      case 'golden': {
-        const f1 = E.PHI, f2 = 1 - E.PHI;
-        for (const f of [f1, f2]) { line(gx(f), 0, gx(f), H, COL.guide, lw); line(0, gy(f), W, gy(f), COL.guide, lw); }
-        drawSpiral(c, W, H, dpr, inCrop);
-        break;
-      }
-      case 'center':
-        line(W / 2, 0, W / 2, H, COL.guide, lw); line(0, H / 2, W, H / 2, COL.faint, lw);
-        ctx.beginPath(); ctx.arc(W / 2, H / 2, Math.min(W, H) * 0.18, 0, Math.PI * 2);
-        ctx.strokeStyle = COL.faint; ctx.lineWidth = lw; ctx.stroke();
-        break;
-      case 'horizon':
-      case 'reflection': {
-        const fs = c.guide === 'horizon' ? [1 / 3, 2 / 3] : [0.5];
-        for (const f of fs) line(0, gy(f), W, gy(f), Math.abs(f - c.horizonTarget) < 0.01 ? COL.focus : COL.faint, Math.abs(f - c.horizonTarget) < 0.01 ? 2 * dpr : lw, Math.abs(f - c.horizonTarget) < 0.01 ? [8 * dpr, 6 * dpr] : null);
-        label('水平線放這裡', 10 * dpr, gy(c.horizonTarget) - 8 * dpr, COL.focus, dpr);
-        break;
-      }
-      case 'diagonal':
-        if (c.diagDir === '/') line(0, H, W, 0, COL.guide, lw); else line(0, 0, W, H, COL.guide, lw);
-        for (const f of [1 / 3, 2 / 3]) { line(gx(f), 0, gx(f), H, COL.faint, lw); line(0, gy(f), W, gy(f), COL.faint, lw); }
-        break;
-      case 'portrait': {
-        // 三分線；眼睛的目標線特別標示
-        for (const f of [1 / 3, 2 / 3]) line(gx(f), 0, gx(f), H, COL.faint, lw);
-        if (c.target.x === 0.5) line(W / 2, 0, W / 2, H, COL.faint, lw);
-        line(0, gy(2 / 3), W, gy(2 / 3), COL.faint, lw);
-        line(0, gy(c.target.y), W, gy(c.target.y), COL.focus, 1.6 * dpr, [8 * dpr, 6 * dpr]);
-        label('眼睛放這條線', 10 * dpr, gy(c.target.y) - 8 * dpr, COL.focus, dpr);
-        break;
-      }
-      case 'fill':
-        line(W / 2, H / 2 - 14 * dpr, W / 2, H / 2 + 14 * dpr, COL.guide, lw);
-        line(W / 2 - 14 * dpr, H / 2, W / 2 + 14 * dpr, H / 2, COL.guide, lw);
-        break;
+      case 'golden': [E.PHI, 1 - E.PHI].forEach((f) => { vline(f); hline(f); }); break;
+      case 'center': case 'reflection': vline(0.5); hline(0.5); break;
+      case 'diagonal': if (c.diagDir === '/') line(0, H, W, 0, faint, lw); else line(0, 0, W, H, faint, lw); break;
+      case 'fill': break;
+      default: [1 / 3, 2 / 3].forEach((f) => { vline(f); hline(f); });
     }
 
-    // 偵測到的水平線（實際位置與傾斜）
-    if (a.horizon.valid && (c.guide === 'horizon' || c.guide === 'reflection' || Math.abs(a.horizon.angle) >= 2)) {
+    // 水平線歪了才畫出實際的水平線
+    if (a.horizon.valid && Math.abs(a.horizon.angle) >= 2) {
       const t = Math.tan(a.horizon.angle * Math.PI / 180);
-      const sh = srcSize();
-      const ar = sh.w / sh.h;
-      const p1 = T({ x: 0, y: a.horizon.y - t * 0.5 * ar });
-      const p2 = T({ x: 1, y: a.horizon.y + t * 0.5 * ar });
-      const tilted = Math.abs(a.horizon.angle) >= 2;
-      line(p1.x, p1.y, p2.x, p2.y, tilted ? '#ff8a5c' : 'rgba(255,255,255,0.8)', 1.6 * dpr, [3 * dpr, 4 * dpr]);
+      const sz = srcSize(), ar = sz.w / sz.h;
+      const p1 = T({ x: 0, y: a.horizon.y - t * 0.5 * ar }), p2 = T({ x: 1, y: a.horizon.y + t * 0.5 * ar });
+      line(p1.x, p1.y, p2.x, p2.y, 'rgba(255,138,92,0.85)', 1.4 * dpr, [4 * dpr, 4 * dpr]);
     }
 
-    // 人臉框
-    const S = a.subject;
-    if (S.kind === 'person') {
-      ctx.strokeStyle = 'rgba(255,255,255,0.9)'; ctx.lineWidth = 1.5 * dpr;
-      for (const f of S.faces) {
-        const sy = f.sizeY || f.size;
-        const p0 = T({ x: f.cx - f.size / 2, y: f.cy - 0.68 * sy }), p1 = T({ x: f.cx + f.size / 2, y: f.cy + 0.55 * sy });
-        const x = Math.min(p0.x, p1.x), y = Math.min(p0.y, p1.y), ww = Math.abs(p1.x - p0.x), hh = Math.abs(p1.y - p0.y);
-        const rr = Math.min(ww, hh) * 0.35;
-        ctx.beginPath();
-        if (ctx.roundRect) ctx.roundRect(x, y, ww, hh, rr); else ctx.rect(x, y, ww, hh);
-        ctx.stroke();
-      }
-    }
-
-    // 主體框（對焦框樣式）
-    const b0 = T({ x: S.box.x, y: S.box.y }), b1 = T({ x: S.box.x + S.box.w, y: S.box.y + S.box.h });
-    const bx = Math.min(b0.x, b1.x), by = Math.min(b0.y, b1.y), bw = Math.abs(b1.x - b0.x), bh = Math.abs(b1.y - b0.y);
-    const L = Math.min(bw, bh) * 0.25 + 4 * dpr;
-    ctx.strokeStyle = COL.focus; ctx.lineWidth = 2 * dpr; ctx.beginPath();
-    ctx.moveTo(bx, by + L); ctx.lineTo(bx, by); ctx.lineTo(bx + L, by);
-    ctx.moveTo(bx + bw - L, by); ctx.lineTo(bx + bw, by); ctx.lineTo(bx + bw, by + L);
-    ctx.moveTo(bx + bw, by + bh - L); ctx.lineTo(bx + bw, by + bh); ctx.lineTo(bx + bw - L, by + bh);
-    ctx.moveTo(bx + L, by + bh); ctx.lineTo(bx, by + bh); ctx.lineTo(bx, by + bh - L);
-    ctx.stroke();
-
-    // 目標圓圈＋主體黃點：「移動手機，讓黃點進入圓圈」
+    if (inCrop && (c.guide === 'horizon' || c.guide === 'reflection')) return;
+    const D = state.disp;
+    const mirror = state.source === 'live' && state.facing === 'user';
     let from, to;
     if (inCrop) {
-      if (c.guide === 'horizon' || c.guide === 'reflection') return;
-      const m = state.source === 'live' && state.facing === 'user';
+      const S = a.subject;
       from = T({ x: S.cx, y: S.cy });
-      to = { x: (m ? 1 - c.target.x : c.target.x) * W, y: c.target.y * H };
+      to = { x: (mirror ? 1 - c.target.x : c.target.x) * W, y: c.target.y * H };
       if (c.guide === 'fill') to = from;
-    } else if (c.guide === 'horizon' || c.guide === 'reflection') {
-      from = T({ x: 0.5, y: a.horizon.y }); to = T({ x: 0.5, y: c.horizonTarget });
     } else {
-      from = T({ x: S.cx, y: S.cy }); to = T(c.guide === 'fill' ? { x: 0.5, y: 0.5 } : c.target);
+      from = T(D ? D.from : { x: a.subject.cx, y: a.subject.cy });
+      to = T(D ? D.to : c.target);
     }
     const ok = inCrop ? c.cropResidual < 0.04 : state.okLatched;
     const col = ok ? COL.ok : COL.focus;
-    const R = 20 * dpr;
-    // 目標圓圈（半透明底，讓圓圈在亮背景上也看得清楚）
+    const R = 18 * dpr;
     ctx.beginPath(); ctx.arc(to.x, to.y, R, 0, Math.PI * 2);
-    ctx.fillStyle = ok ? 'rgba(98,224,143,0.22)' : 'rgba(0,0,0,0.18)'; ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,0.35)'; ctx.lineWidth = 4.5 * dpr; ctx.stroke();
     ctx.strokeStyle = col; ctx.lineWidth = 2.5 * dpr; ctx.stroke();
-    // 主體黃點（有黑邊）
     ctx.beginPath(); ctx.arc(from.x, from.y, 7 * dpr, 0, Math.PI * 2);
-    ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5 * dpr; ctx.stroke();
-    // 黃點到圓圈的細虛線，只表示「這兩個要對齊」，沒有方向
-    const d = Math.hypot(to.x - from.x, to.y - from.y);
-    if (d > R + 10 * dpr) {
-      const ux = (to.x - from.x) / d, uy = (to.y - from.y) / d;
-      line(from.x + ux * 10 * dpr, from.y + uy * 10 * dpr, to.x - ux * (R + 3 * dpr), to.y - uy * (R + 3 * dpr), 'rgba(255,255,255,0.55)', 1.2 * dpr, [3 * dpr, 4 * dpr]);
-    }
-    // 畫面邊緣：手機要往哪移
-    if (!inCrop && !ok && state.source === 'live') drawPhoneArrows(c, W, H, dpr);
-
+    ctx.fillStyle = col; ctx.fill();
+    ctx.strokeStyle = state.lock ? '#fff' : 'rgba(0,0,0,0.55)'; ctx.lineWidth = (state.lock ? 2.5 : 1.5) * dpr; ctx.stroke();
   }
 
-  /* 手機移動方向（以螢幕上看到的方向計算，前鏡頭的鏡像也正確） */
+  /*
+   * 手機移動方向（以螢幕上看到的方向計算，前鏡頭的鏡像也正確）。
+   * 一次只提示一個方向（差最多的那一軸），而且加遲滯：
+   * 開始提示要差 5% 以上，已經在提示的方向要回到 2% 以內才換。
+   */
   function phoneDir(c) {
     const mirror = state.source === 'live' && state.facing === 'user';
     const ddx = mirror ? -c.aim.dx : c.aim.dx, ddy = c.aim.dy; // 主體在螢幕上要移動的量
-    const thr = 0.045;
-    return { x: Math.abs(ddx) > thr ? -Math.sign(ddx) : 0, y: Math.abs(ddy) > thr ? -Math.sign(ddy) : 0, ddx, ddy };
-  }
-  function drawPhoneArrows(c, W, H, dpr) {
-    const p = phoneDir(c);
-    const draw = (cx, cy, ang, text) => {
-      ctx.save(); ctx.translate(cx, cy);
-      ctx.font = `700 ${13 * dpr}px "Noto Sans TC", system-ui, sans-serif`;
-      const tw = ctx.measureText(text).width;
-      const bw = tw + 44 * dpr, bh = 30 * dpr;
-      ctx.fillStyle = 'rgba(255,197,49,0.92)';
-      ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(-bw / 2, -bh / 2, bw, bh, bh / 2); else ctx.rect(-bw / 2, -bh / 2, bw, bh); ctx.fill();
-      ctx.fillStyle = '#1d1606'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      const arrow = { 0: '→', 90: '↓', 180: '←', 270: '↑' }[ang];
-      ctx.fillText(ang === 0 || ang === 90 ? `${text} ${arrow}` : `${arrow} ${text}`, 0, 1 * dpr);
-      ctx.restore();
-    };
-    const m = 14 * dpr;
-    if (p.x > 0) draw(W - 62 * dpr, H / 2, 0, '手機往右');
-    if (p.x < 0) draw(62 * dpr, H / 2, 180, '手機往左');
-    if (p.y > 0) draw(W / 2, H - m - 18 * dpr, 90, '手機往下');
-    if (p.y < 0) draw(W / 2, m + 48 * dpr, 270, '手機往上');
-  }
-
-  function drawSpiral(c, W, H, dpr, inCrop) {
-    // 以目標點為中心的黃金螺旋，往離目標最遠的角落展開
-    const tx = c.target.x * W, ty = c.target.y * H;
-    const fx = c.target.x < 0.5 ? W : 0, fy = c.target.y < 0.5 ? H : 0;
-    const R = Math.hypot(fx - tx, fy - ty);
-    const start = Math.atan2(fy - ty, fx - tx);
-    const b = Math.log(1.618034) / (Math.PI / 2);
-    const dir = (c.target.x < 0.5) === (c.target.y < 0.5) ? 1 : -1;
-    ctx.save(); ctx.beginPath(); ctx.rect(0, 0, W, H); ctx.clip();
-    ctx.beginPath();
-    for (let th = 0; th >= -7 * Math.PI; th -= 0.05) {
-      const r = R * Math.exp(b * th);
-      const ang = start + dir * th;
-      const x = tx + Math.cos(ang) * r, y = ty + Math.sin(ang) * r;
-      if (th === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.strokeStyle = 'rgba(255,197,49,0.55)'; ctx.lineWidth = 1.4 * dpr; ctx.stroke();
-    ctx.restore();
+    const D = state.dir;
+    const ax = Math.abs(ddx), ay = Math.abs(ddy);
+    if (D.axis === 'x' && ax < 0.02) D.axis = null;
+    if (D.axis === 'y' && ay < 0.02) D.axis = null;
+    // 另一軸明顯差更多時就換過去提示
+    if (D.axis === 'x' && ay > ax * 1.5 + 0.03) D.axis = 'y';
+    else if (D.axis === 'y' && ax > ay * 1.5 + 0.03) D.axis = 'x';
+    if (!D.axis) { if (Math.max(ax, ay) > 0.05) D.axis = ax >= ay ? 'x' : 'y'; }
+    if (D.axis === 'x') return ddx < 0 ? '→ 手機往右' : '← 手機往左';
+    if (D.axis === 'y') return ddy < 0 ? '↓ 手機往下' : '↑ 手機往上';
+    return '';
   }
 
   let lastHint = '';
@@ -1967,23 +1932,18 @@ button { cursor: pointer; }
     if (state.mode === 'crop') {
       const keep = Math.round(c.crop.w * c.crop.h * 100);
       if (c.crop.w > 0.97) text = '不需裁切，直接拍就是這個構圖';
-      else if (keep < 15) text = `只保留 ${keep}% 畫面，畫質會明顯下降，建議直接靠近拍`;
-      else text = `拍下後裁成這樣（保留 ${keep}% 畫面）`;
+      else if (keep < 15) text = `只保留 ${keep}% 畫面，建議直接靠近拍`;
+      else text = `拍下後裁成這樣（保留 ${keep}%）`;
       ok = c.cropResidual < 0.04;
     } else {
       ok = state.okLatched;
-      const p = phoneDir(c);
-      const parts = [];
-      if (p.x) parts.push(p.x > 0 ? '手機往右' : '手機往左');
-      if (p.y) parts.push(p.y > 0 ? '手機往下' : '手機往上');
-      if (c.aim.sizeText) parts.push(c.aim.sizeText);
-      const move = parts.join('、');
-      if (state.source === 'still') text = ok ? '構圖到位' : `拍攝時：${move || '微調一下位置'}`;
+      const move = phoneDir(c) || c.aim.sizeText || '';
+      if (state.source === 'still') text = ok ? '構圖到位' : `拍攝時：${move.replace(/^[→←↑↓] /, '') || '微調位置'}`;
       else if (ok) text = '構圖到位，可以拍了';
       else if (performance.now() - state.lostAt < 2500) text = '主體跟丟了，請再點一次';
-      else text = (move || '微調一下') + '，讓黃點進入圓圈';
+      else if (c.tips.length && /傾斜/.test(c.tips[0])) text = '先把水平線轉正';
+      else text = move || '讓黃點進入圓圈';
     }
-    if (c.tips.length && !ok && state.mode === 'aim' && /傾斜/.test(c.tips[0])) text = '先把水平線轉正';
     const key = text + ok;
     if (key !== lastHint) {
       els.hint.textContent = text;
