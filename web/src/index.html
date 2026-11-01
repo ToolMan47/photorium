@@ -19,6 +19,7 @@
       <canvas id="view" aria-label="相機畫面與構圖參考線"></canvas>
       <div class="hint" id="hint" role="status"></div>
       <div class="src-tag" id="srcTag"></div>
+      <button type="button" class="lock-tag" id="lockTag" hidden>已鎖定主體　✕</button>
     </div>
   </main>
 
@@ -33,6 +34,7 @@
       <h2 class="detail-title" id="detailTitle"></h2>
       <p class="reason" id="reason"></p>
       <ul class="tips" id="tips"></ul>
+      <p class="howto" id="howto">點取景畫面上的東西，可以指定要拍的主體。</p>
     </div>
     <div class="controls">
       <label class="side-btn" for="fileIn" id="fileBtn">
@@ -53,8 +55,8 @@
       <div class="result-head">
         <h2 id="resultTitle">拍攝結果</h2>
         <div class="seg" role="tablist" aria-label="切換顯示">
-          <button type="button" id="showCrop" class="on">構圖版本</button>
-          <button type="button" id="showOrig">原圖</button>
+          <button type="button" id="showCrop" class="on">裁切版本</button>
+          <button type="button" id="showOrig">取景畫面</button>
         </div>
       </div>
       <div class="result-img"><img id="resultImg" alt="拍攝結果"></div>

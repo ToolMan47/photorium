@@ -121,7 +121,7 @@
         S[i] = (0.62 * sal[i] + 0.38 * edgeDen[i]) * (0.65 + 0.35 * center) * border;
       }
     }
-    const horizon = findHorizon(gx, gy, gyB, mag, w, h);
+    const horizon = findHorizon(gx, gy, gyB, mag, w, h, Lb, Bb);
     // 水平線本身是很強的邊緣，但它是背景結構，不是主體：沿著水平線降低顯著性
     if (horizon.valid) {
       const t = Math.tan(horizon.angle * Math.PI / 180), band = Math.max(2, h * 0.035);
@@ -135,7 +135,13 @@
     }
     const Sal = normalize(boxBlur(S, w, h, 2));
     const person = opts.faces && opts.faces.length ? buildPerson(opts.faces) : null;
-    const subject = person || findSubject(Sal, w, h);
+    let subject;
+    if (person) subject = person;
+    else if (opts.subject) {
+      // 使用者點選並追蹤中的主體
+      const b = opts.subject.box;
+      subject = { kind: 'locked', cx: opts.subject.cx, cy: opts.subject.cy, box: b, area: b.w * b.h, conf: 1 };
+    } else subject = findSubject(Sal, w, h);
     const sym = symmetry(Lb, w, h, mL.std);
     const lines = lineOrientation(gx, gy, mag, w, h);
 
@@ -246,7 +252,7 @@
     return { cx: best.sx / best.sum / w, cy: best.sy / best.sum / h, box, area, conf, wide };
   }
 
-  function findHorizon(gx, gy, gyB, mag, w, h) {
+  function findHorizon(gx, gy, gyB, mag, w, h, Lb, Bb) {
     const n = w * h;
     const hE = new Float32Array(n);
     for (let i = 0; i < n; i++) {
@@ -299,10 +305,30 @@
       strength,
       coverage,
       // 角度落在搜尋範圍的邊界（±14°），通常不是真的水平線，而是斜向的結構
-      valid: strength > 2.4 && coverage > 0.62 && Math.abs(best.a) < 14,
+      // 真正的水平線（天空與地面、水面）上下兩側的亮度或色調會明顯不同；
+      // 桌緣、路緣、招牌邊這類線條兩側常常很接近，不算水平線
+      regionDiff: sideDiff(Lb, Bb, w, h, best.y0, t),
+      // 門檻依 20 張實拍照片調整：太靠近上下緣、斜度大、強度弱的通常是桌緣或招牌邊
+      valid: strength > 3 && coverage > 0.62 && Math.abs(best.a) <= 6 &&
+        best.y0 / h > 0.2 && best.y0 / h < 0.85 && sideDiff(Lb, Bb, w, h, best.y0, t) > 12,
       aboveTexture: na ? above / na : 0,
       belowTexture: nb ? below / nb : 0,
     };
+  }
+
+  function sideDiff(Lb, Bb, w, h, y0, t) {
+    const cx = (w - 1) / 2, gap = Math.max(2, Math.round(h * 0.03)), band = Math.max(3, Math.round(h * 0.12));
+    let la = 0, lb = 0, ba = 0, bb = 0, na = 0, nb = 0;
+    for (let x = 0; x < w; x++) {
+      const ly = Math.round(y0 + t * (x - cx));
+      for (let k = gap; k < gap + band; k++) {
+        const ya = ly - k, yb = ly + k;
+        if (ya >= 0) { la += Lb[ya * w + x]; ba += Bb[ya * w + x]; na++; }
+        if (yb < h) { lb += Lb[yb * w + x]; bb += Bb[yb * w + x]; nb++; }
+      }
+    }
+    if (!na || !nb) return 0;
+    return Math.abs(la / na - lb / nb) + 0.7 * Math.abs(ba / na - bb / nb);
   }
 
   function symmetry(Lb, w, h, std) {
@@ -380,6 +406,12 @@
       faceSize: fs / n, faceSizeY: fsy / n,
       headTop: top, chin, shoulders,
       eyeSpread: eyeMax - eyeMin,
+      // 估計的全身範圍（頭頂到腳底約 8 倍框高），裁切時避免切到身體
+      bodyBox: (() => {
+        const feet = Math.min(1, top + 8 * (fsy / n));
+        const bx0 = clamp(x0 - 0.6 * fs / n, 0, 1), bx1 = clamp(x1 + 0.6 * fs / n, 0, 1);
+        return { x: bx0, y: yTop, w: bx1 - bx0, h: Math.max(0.01, feet - yTop) };
+      })(),
     };
   }
 
@@ -418,6 +450,12 @@
   function fitCrop(C, p, box, opt) {
     opt = opt || {};
     const minS = opt.minScale || 0.5;
+    if (opt.fixed) {
+      const s0 = clamp(opt.fixed, minS, 1);
+      const x0 = clamp(C.x - p.x * s0, 0, 1 - s0), y0 = clamp(C.y - p.y * s0, 0, 1 - s0);
+      const pos0 = { x: (C.x - x0) / s0, y: (C.y - y0) / s0 };
+      return { crop: { x: x0, y: y0, w: s0, h: s0 }, pos: pos0, residual: dist(pos0, p) };
+    }
     const big = 9;
     const lim = [
       p.x > 0 ? C.x / p.x : big,
@@ -436,10 +474,82 @@
     return { crop: { x, y, w: s, h: s }, pos, residual: dist(pos, p) };
   }
 
-  // ---------- 構圖建議 ----------
-  const SIDE = (p) => (p.y < 0.5 ? '上' : '下') + (p.x < 0.5 ? '左' : '右');
+  /*
+   * 比較好看的裁切：在可行的大小範圍內試幾種，挑「主體位置準、邊緣不切過物體、保留越多越好」的。
+   * 邊緣有沒有切過物體，用裁切框四邊上的顯著性平均值判斷。
+   */
+  function bestCrop(a, C, p, box, opt) {
+    opt = opt || {};
+    const keep = opt.keep || box;
+    const outside = (k) => {
+      if (!keep) return 0;
+      const ix = Math.max(0, Math.min(k.x + k.w, keep.x + keep.w) - Math.max(k.x, keep.x));
+      const iy = Math.max(0, Math.min(k.y + k.h, keep.y + keep.h) - Math.max(k.y, keep.y));
+      return 1 - (ix * iy) / Math.max(1e-6, keep.w * keep.h);
+    };
+    const base = fitCrop(C, p, box, opt);
+    if (!a || !a.saliency) return base;
+    const need = box ? Math.max(box.w, box.h) * 1.12 : 0;
+    const lo = Math.max(opt.minScale || 0.5, Math.min(1, need));
+    const hi = opt.scale ? Math.min(1, Math.max(opt.scale, lo)) : 1;
+    let best = null;
+    for (let i = 0; i <= 8; i++) {
+      const sc = lo + (hi - lo) * i / 8;
+      const f = fitCrop(C, p, box, Object.assign({}, opt, { fixed: sc }));
+      const border = edgeSaliency(a, f.crop);
+      const cost = f.residual * 3 + border * 0.9 + (1 - sc) * 0.6 + (opt.scale ? Math.abs(sc - opt.scale) * 1.5 : 0) + outside(f.crop) * 4;
+      if (!best || cost < best.cost) best = Object.assign(f, { cost, border });
+    }
+    return best.residual <= base.residual + 0.02 || outside(base.crop) > 0.05 ? best : base;
+  }
 
-  function suggest(a) {
+  function edgeSaliency(a, k) {
+    if (k.w > 0.995) return 0;
+    const w = a.width, h = a.height, S = a.saliency;
+    const x0 = Math.round(k.x * (w - 1)), x1 = Math.round((k.x + k.w) * (w - 1));
+    const y0 = Math.round(k.y * (h - 1)), y1 = Math.round((k.y + k.h) * (h - 1));
+    let sum = 0, n = 0;
+    const at = (x, y) => { sum += S[clamp(y, 0, h - 1) * w + clamp(x, 0, w - 1)]; n++; };
+    // 只計算真的有被裁掉的那幾條邊
+    for (let x = x0; x <= x1; x += 2) { if (k.y > 0.005) at(x, y0); if (k.y + k.h < 0.995) at(x, y1); }
+    for (let y = y0; y <= y1; y += 2) { if (k.x > 0.005) at(x0, y); if (k.x + k.w < 0.995) at(x1, y); }
+    return n ? sum / n : 0;
+  }
+
+  // 目標點不能讓主體被推出畫面：依主體框相對於主體點的位置，限制目標的範圍
+  function keepInside(t, C, box) {
+    if (!box) return t;
+    const m = 0.03;
+    const l = C.x - box.x, r = box.x + box.w - C.x, u = C.y - box.y, d = box.y + box.h - C.y;
+    const fx = (v, a, b) => (a <= b ? clamp(v, a, b) : (a + b) / 2);
+    return { x: fx(t.x, l + m, 1 - r - m), y: fx(t.y, u + m, 1 - d - m) };
+  }
+
+  // 大的主體不硬推到三分點：越大越接近中央
+  function sizeAware(t, S) {
+    const big = Math.max(S.box.w, S.box.h);
+    const k = clamp((big - 0.35) / 0.35, 0, 1);
+    return { x: t.x + (0.5 - t.x) * k, y: t.y + (0.5 - t.y) * k };
+  }
+
+  // 黏著：之前選過的目標點如果仍是候選，就繼續用它，避免目標在幾個點之間跳來跳去
+  function sticky(prev, id, best, cands, cost) {
+    const pv = prev && prev[id];
+    if (!pv) return best;
+    const same = cands.find((c) => Math.abs(c.x - pv.x) < 0.02 && Math.abs(c.y - pv.y) < 0.02);
+    if (!same) return best;
+    return cost(same) < cost(best) + 0.25 ? same : best;
+  }
+
+  // ---------- 構圖建議 ----------
+  const SIDE = (p) => (p.x < 0.5 ? '左' : '右') + (p.y < 0.5 ? '上' : '下');
+
+  /*
+   * opts.prev：上一次各構圖的目標點（{ id: {x, y} }），讓目標點保持穩定
+   */
+  function suggest(a, opts) {
+    opts = opts || {};
+    const prev = opts.prev || null;
     const S = a.subject;
     const C = { x: S.cx, y: S.cy };
     const out = [];
@@ -452,25 +562,24 @@
     const symEff = a.symLR * clamp(a.lines.vertical * 3 + S.conf * 0.4, 0, 1);
 
     const P = S.kind === 'person' ? S : null;
-    if (P) suggestPortrait(P, a, out, emptierRight, symEff);
+    if (P) suggestPortrait(P, a, out, emptierRight, symEff, prev);
 
     // 1. 三分法（有人像時改用人像版本）
     if (!P) {
       const pts = [{ x: 1 / 3, y: 1 / 3 }, { x: 2 / 3, y: 1 / 3 }, { x: 1 / 3, y: 2 / 3 }, { x: 2 / 3, y: 2 / 3 }];
-      let best = null, bc = Infinity;
-      for (const p of pts) {
+      const cost = (p) => {
         let c = dist(C, p);
         const wantLeft = emptierRight; // 右邊空 → 主體放左邊，視線往空的方向延伸
         if ((p.x < 0.5) !== wantLeft) c += 0.1;
-        if (a.horizon.valid) {
-          // 有水平線時，主體放在天空那側或地面那側都可，但避免和水平線同高
-          if (Math.abs(p.y - a.horizon.y) < 0.08) c += 0.05;
-        }
-        if (c < bc) { bc = c; best = p; }
-      }
+        // 有水平線時，避免主體和水平線同高
+        if (a.horizon.valid && Math.abs(p.y - a.horizon.y) < 0.08) c += 0.05;
+        return c;
+      };
+      let best = pts.reduce((m, p) => (cost(p) < cost(m) ? p : m), pts[0]);
+      best = sticky(prev, 'thirds', best, pts, cost);
       const score = 58 + 22 * S.conf + 10 * sizeOk - 30 * Math.max(0, symEff - 0.65);
       out.push(make('thirds', '三分法', score, best, a, {
-        reason: `把主體放在${SIDE(best)}的三分點，${emptierRight ? '右' : '左'}側較空，留給視線延伸，比置中更有張力。`,
+        reason: `把主體放在${SIDE(best)}的三分點，${best.x < 0.5 ? '右' : '左'}側留出空間讓視線延伸，比置中更有張力。`,
         guide: 'thirds',
       }));
     }
@@ -478,12 +587,9 @@
     // 2. 黃金比例
     if (!P) {
       const pts = [{ x: PHI, y: PHI }, { x: 1 - PHI, y: PHI }, { x: PHI, y: 1 - PHI }, { x: 1 - PHI, y: 1 - PHI }];
-      let best = pts[0], bc = Infinity;
-      for (const p of pts) {
-        let c = dist(C, p);
-        if ((p.x < 0.5) !== emptierRight) c += 0.1;
-        if (c < bc) { bc = c; best = p; }
-      }
+      const cost = (p) => dist(C, p) + ((p.x < 0.5) !== emptierRight ? 0.1 : 0);
+      let best = pts.reduce((m, p) => (cost(p) < cost(m) ? p : m), pts[0]);
+      best = sticky(prev, 'golden', best, pts, cost);
       const small = S.area > 0.005 && S.area < 0.2 ? 1 : 0;
       const score = 50 + 18 * S.conf + 10 * small + 12 * a.emptiness - 30 * Math.max(0, symEff - 0.65);
       out.push(make('golden', '黃金比例', score, best, a, {
@@ -508,11 +614,12 @@
     // 4. 水平線
     if (a.horizon.valid) {
       const skyRich = a.horizon.aboveTexture > a.horizon.belowTexture * 1.15;
-      const ty = skyRich ? 2 / 3 : 1 / 3;
+      let ty = skyRich ? 2 / 3 : 1 / 3;
+      if (prev && prev.horizon && Math.abs(a.horizon.aboveTexture - a.horizon.belowTexture) < 0.4 * Math.max(a.horizon.aboveTexture, a.horizon.belowTexture)) ty = prev.horizon.y;
       const strengthN = clamp((a.horizon.strength - 2.4) / 3, 0, 1);
-      const score = 56 + 26 * strengthN + 10 * a.horizon.coverage;
+      const score = 50 + 22 * strengthN + 8 * a.horizon.coverage;
       const tips = [];
-      if (Math.abs(a.horizon.angle) >= 1) tips.push(`水平線傾斜約 ${Math.abs(a.horizon.angle)}°，請把手機往${a.horizon.angle > 0 ? '左（逆時針）' : '右（順時針）'}轉正`);
+      if (Math.abs(a.horizon.angle) >= 2) tips.push(`水平線傾斜約 ${Math.abs(a.horizon.angle)}°，請把手機往${a.horizon.angle > 0 ? '左（逆時針）' : '右（順時針）'}轉正`);
       const c = make('horizon', '水平線三分', score, { x: C.x, y: ty }, a, {
         reason: skyRich
           ? '天空的層次比地面豐富，把水平線壓到下三分之一，讓天空佔三分之二。'
@@ -590,7 +697,7 @@
     return out;
   }
 
-  function suggestPortrait(P, a, out, emptierRight, symEff) {
+  function suggestPortrait(P, a, out, emptierRight, symEff, prev) {
     const fsz = P.faceSize;
     const who = P.count > 1 ? `${P.count} 個人` : '人物';
 
@@ -604,7 +711,10 @@
 
     // 人像三分：眼睛在上三分線，人物偏一側，另一側留給視線
     {
-      const tx = emptierRight ? 1 / 3 : 2 / 3;
+      let tx = emptierRight ? 1 / 3 : 2 / 3;
+      // 左右兩側差不多空時，沿用上一次的那一側
+      const wl = a.sideWeight.left, wr = a.sideWeight.right;
+      if (prev && prev['p-thirds'] && Math.abs(wl - wr) < 0.3 * Math.max(wl, wr)) tx = prev['p-thirds'].x;
       const ty = eyeTargetY(P, 1 / 3);
       const score = 80 + (fsz > 0.05 && fsz < 0.3 ? 6 : 0) - (P.count >= 2 ? 10 : 0);
       out.push(make('p-thirds', '人像三分', score, { x: tx, y: ty }, a, {
@@ -641,18 +751,26 @@
   function make(id, name, score, target, a, o) {
     const S = a.subject;
     const C = { x: S.cx, y: S.cy };
+    const pick = target; // 調整前的候選點，供下一次「黏著」比對
     let fit;
     if (o.anchor && (id === 'horizon' || id === 'reflection')) {
       // 以水平線為準：讓水平線落在目標高度，水平方向以主體為準置中
-      fit = fitCrop({ x: 0.5, y: o.anchor.y }, { x: 0.5, y: target.y }, null, { minScale: 0.6 });
+      const sure = S.kind === 'person' || S.kind === 'locked' || S.conf >= 0.5;
+      fit = bestCrop(a, { x: 0.5, y: o.anchor.y }, { x: 0.5, y: target.y }, null, { minScale: sure ? 0.6 : 0.8, keep: sure ? S.box : null });
     } else {
-      fit = fitCrop(C, target, S.box, { scale: o.scale, minScale: o.minScale });
+      if (S.kind !== 'person' && id !== 'center' && id !== 'fill') target = sizeAware(target, S);
+      target = keepInside(target, C, S.box);
+      const sure = S.kind === 'person' || S.kind === 'locked' || S.conf >= 0.5;
+      const minScale = sure ? o.minScale : Math.max(o.minScale || 0.5, 0.85);
+      // 人像（特寫除外）要保住估計的全身，避免切在腿或腳
+      const keep = S.kind === 'person' && id !== 'p-headshot' && S.faceSize < 0.13 ? S.bodyBox : S.box;
+      fit = bestCrop(a, C, target, S.box, { scale: sure ? o.scale : undefined, minScale, keep });
     }
     // 拍攝時的移動提示：主體要從 C 移到 target（整個畫面座標）
     const aimFrom = o.anchor || C;
     const aimTo = o.anchor ? { x: o.anchor.x, y: target.y } : target;
     return {
-      id, name, score, target,
+      id, name, score, target, pick,
       reason: o.reason,
       tips: o.tips || [],
       guide: o.guide,
@@ -664,23 +782,27 @@
     };
   }
 
-  /* 移動提示：主體需要往哪裡移 → 換算成鏡頭要往哪裡轉 */
+  /*
+   * 移動提示：主體在畫面中要從 from 移到 to。
+   * 手機往右移時，畫面中的東西會往左跑，所以「主體要往左」＝「手機往右」。
+   * dx、dy 是主體在畫面中需要移動的量；sizeText 是遠近提示。
+   */
   function aimHint(from, to, S, size) {
     const dx = to.x - from.x, dy = to.y - from.y;
     const d = Math.hypot(dx, dy);
     const parts = [];
     const thr = 0.045;
-    // 主體要往左 → 鏡頭往右；主體要往上 → 鏡頭往下
-    if (Math.abs(dx) > thr) parts.push(dx < 0 ? '鏡頭往右' : '鏡頭往左');
-    if (Math.abs(dy) > thr) parts.push(dy < 0 ? '鏡頭往下' : '鏡頭往上');
+    if (Math.abs(dx) > thr) parts.push(dx < 0 ? '手機往右' : '手機往左');
+    if (Math.abs(dy) > thr) parts.push(dy < 0 ? '手機往下' : '手機往上');
+    const nDir = parts.length;
     if (size === 'large' && S && (S.kind === 'person' ? S.faceSize < 0.2 : S.area < 0.12)) parts.push('靠近一點');
     if (size === 'small' && S && S.area > 0.12) parts.push('退後一點');
     if (!size && S && S.kind !== 'person' && S.area > 0.55) parts.push('退後一點');
     if (S && S.kind === 'person' && (S.headTop < 0.01 || S.chin > 0.99)) parts.push('退後一點');
-    return { dx, dy, dist: d, text: parts.join('、'), ok: parts.length === 0 };
+    return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, aimHint, PHI };
+  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);

@@ -12,6 +12,7 @@
     result: $('result'), resultImg: $('resultImg'), resultMeta: $('resultMeta'), resultTitle: $('resultTitle'),
     showCrop: $('showCrop'), showOrig: $('showOrig'), saveCrop: $('saveCrop'), saveOrig: $('saveOrig'),
     closeResult: $('closeResult'), toast: $('toast'), video: $('video'),
+    lockTag: $('lockTag'), howto: $('howto'),
   };
   const ctx = els.view.getContext('2d');
   const work = document.createElement('canvas');
@@ -33,6 +34,10 @@
     lastChipRender: 0,
     lastAnalyze: 0,
     shot: null,
+    lock: null,            // 使用者點選的主體：{ type: 'patch' | 'face', ... }
+    prevTargets: {},       // 各構圖上一次的目標點（讓目標保持穩定）
+    okLatched: false,      // 「構圖到位」狀態（加遲滯，避免一直閃）
+    lostAt: -1e9,
   };
 
   // ---------- 示範場景（程式繪製，不需外部圖片） ----------
@@ -149,6 +154,8 @@
     state.stillName = label;
     state.smooth = null;
     state.selectedId = null;
+    state.prevTargets = {};
+    setLock(null);
     els.srcTag.textContent = label;
     els.camToggle.hidden = !state.cameraOk;
     els.camToggle.textContent = '回到相機';
@@ -178,6 +185,8 @@
       state.source = 'live';
       state.smooth = null;
       state.selectedId = null;
+      state.prevTargets = {};
+      setLock(null);
       els.srcTag.textContent = '';
       els.camToggle.hidden = false;
       els.camToggle.textContent = '切換鏡頭';
@@ -253,7 +262,26 @@
     work.width = aw; work.height = Math.max(8, Math.round(aw * h / w));
     wctx.drawImage(src, 0, 0, work.width, work.height);
     const data = wctx.getImageData(0, 0, work.width, work.height);
-    const a = E.analyze(data, { faces: detectFaces(src, w, h, isStill) });
+    let faces = detectFaces(src, w, h, isStill);
+    const opts = {};
+    if (state.lock && state.lock.type === 'face') {
+      // 鎖定某個人：只用離鎖定位置最近的那張臉
+      const L = state.lock;
+      let best = null, bd = 0.25;
+      for (const f of faces) { const d = Math.hypot(f.cx - L.cx, f.cy - L.cy); if (d < bd) { bd = d; best = f; } }
+      if (best) { L.cx = best.cx; L.cy = best.cy; L.seen = performance.now(); faces = [best]; }
+      else if (performance.now() - L.seen > 1500) { lostLock(); }
+      else faces = L.last ? [L.last] : [];
+      if (best) L.last = best;
+    } else if (state.lock && state.lock.type === 'patch') {
+      faces = [];
+      const L = state.lock;
+      if (!isStill) trackPatch(L, data);
+      if (state.lock) opts.subject = { cx: L.cx, cy: L.cy, box: { x: L.cx - L.bw / 2, y: L.cy - L.bh / 2, w: L.bw, h: L.bh } };
+    }
+    opts.faces = faces;
+    state.lastGray = data;
+    const a = E.analyze(data, opts);
     if (!isStill && state.smooth && state.smooth.subject.kind === a.subject.kind) {
       const k = 0.35, s = state.smooth, n = a.subject;
       const lerp = (p, q) => p + (q - p) * k;
@@ -268,7 +296,8 @@
     }
     state.smooth = a;
     state.analysis = a;
-    const comps = E.suggest(a);
+    const comps = E.suggest(a, { prev: state.prevTargets });
+    for (const c of comps) state.prevTargets[c.id] = c.pick;
     state.comps = comps;
     if (!state.selectedId || !comps.find((c) => c.id === state.selectedId)) state.selectedId = comps[0] && comps[0].id;
     const now = performance.now();
@@ -276,6 +305,106 @@
     renderDetail();
     renderReadout();
   }
+
+  // ---------- 點畫面指定主體 ----------
+  const PATCH = 16; // 模板取樣格數（16×16）
+  function grayAt(img, x, y) {
+    const xi = Math.max(0, Math.min(img.width - 1, x | 0)), yi = Math.max(0, Math.min(img.height - 1, y | 0));
+    const i = (yi * img.width + xi) * 4;
+    return 0.299 * img.data[i] + 0.587 * img.data[i + 1] + 0.114 * img.data[i + 2];
+  }
+  function samplePatch(img, cx, cy, bw, bh) {
+    const v = new Float32Array(PATCH * PATCH);
+    let m = 0;
+    for (let j = 0; j < PATCH; j++) for (let i = 0; i < PATCH; i++) {
+      const x = (cx + (i / (PATCH - 1) - 0.5) * bw) * (img.width - 1);
+      const y = (cy + (j / (PATCH - 1) - 0.5) * bh) * (img.height - 1);
+      const g = grayAt(img, x, y); v[j * PATCH + i] = g; m += g;
+    }
+    m /= v.length;
+    for (let k = 0; k < v.length; k++) v[k] -= m; // 去掉平均亮度，曝光變化時仍能比對
+    return v;
+  }
+  function patchDiff(a, b) { let d = 0; for (let k = 0; k < a.length; k++) d += Math.abs(a[k] - b[k]); return d / a.length; }
+
+  /* 模板比對追蹤：在上一次位置附近找最像的位置 */
+  function trackPatch(L, img) {
+    const R = 0.18, step = 1 / (img.width - 1);
+    let best = null;
+    for (let dy = -R; dy <= R; dy += step * 2) {
+      for (let dx = -R; dx <= R; dx += step * 2) {
+        const cx = L.cx + dx, cy = L.cy + dy;
+        if (cx < 0 || cx > 1 || cy < 0 || cy > 1) continue;
+        const d = patchDiff(L.tpl, samplePatch(img, cx, cy, L.bw, L.bh));
+        if (!best || d < best.d) best = { d, cx, cy };
+      }
+    }
+    if (!best) return;
+    // 在最佳位置附近再細找一次
+    const c0 = best;
+    for (let dy = -step * 2; dy <= step * 2; dy += step) {
+      for (let dx = -step * 2; dx <= step * 2; dx += step) {
+        const d = patchDiff(L.tpl, samplePatch(img, c0.cx + dx, c0.cy + dy, L.bw, L.bh));
+        if (d < best.d) best = { d, cx: c0.cx + dx, cy: c0.cy + dy };
+      }
+    }
+    if (best.d > Math.max(14, L.base * 2.2)) {
+      L.miss = (L.miss || 0) + 1;
+      if (L.miss > 6) lostLock();
+      return;
+    }
+    L.miss = 0;
+    L.cx = best.cx; L.cy = best.cy;
+    // 模板慢慢更新，適應角度與光線變化
+    const now = samplePatch(img, L.cx, L.cy, L.bw, L.bh);
+    for (let k = 0; k < now.length; k++) L.tpl[k] = L.tpl[k] * 0.9 + now[k] * 0.1;
+  }
+
+  function setLock(L) {
+    state.lock = L;
+    els.lockTag.hidden = !L;
+    els.howto.hidden = !!L;
+    state.prevTargets = {};
+    state.okLatched = false;
+  }
+  function lostLock() {
+    setLock(null);
+    state.lostAt = performance.now();
+  }
+
+  function onStageTap(ev) {
+    if (!state.analysis || !els.result.hidden) return;
+    const r = els.view.getBoundingClientRect();
+    let u = (ev.clientX - r.left) / r.width, v = (ev.clientY - r.top) / r.height;
+    if (u < 0 || u > 1 || v < 0 || v > 1) return;
+    const mirror = state.source === 'live' && state.facing === 'user';
+    if (mirror) u = 1 - u;
+    const c = selected();
+    if (state.mode === 'crop' && c) { u = c.crop.x + u * c.crop.w; v = c.crop.y + v * c.crop.h; }
+    // 點到人臉 → 鎖定那個人
+    for (const f of faceState.faces) {
+      const sy = f.sizeY || f.size;
+      if (Math.abs(u - f.cx) < f.size * 0.8 && Math.abs(v - f.cy) < sy * 1.3) {
+        setLock({ type: 'face', cx: f.cx, cy: f.cy, seen: performance.now(), last: f });
+        analyzeNow(state.source === 'still');
+        return;
+      }
+    }
+    // 其他 → 以點的位置建立模板；若點在自動偵測的主體框內，沿用框的大小
+    const S = state.analysis.subject;
+    const { w, h } = srcSize();
+    let bw = 0.2, bh = 0.2 * w / h;
+    const inBox = u >= S.box.x && u <= S.box.x + S.box.w && v >= S.box.y && v <= S.box.y + S.box.h;
+    if (inBox && S.kind !== 'person' && S.box.w < 0.6 && S.box.h < 0.6) { bw = Math.max(0.08, S.box.w); bh = Math.max(0.08, S.box.h); }
+    const img = state.lastGray;
+    const tpl = samplePatch(img, u, v, bw, bh);
+    // 基準差異：模板和自己附近一點點位移的差，用來判斷之後是否跟丟
+    const base = patchDiff(tpl, samplePatch(img, u + 2 / img.width, v, bw, bh));
+    setLock({ type: 'patch', cx: u, cy: v, bw, bh, tpl, base, miss: 0 });
+    analyzeNow(state.source === 'still');
+  }
+  els.view.addEventListener('click', onStageTap);
+  els.lockTag.addEventListener('click', () => { setLock(null); analyzeNow(state.source === 'still'); });
 
   function selected() { return state.comps.find((c) => c.id === state.selectedId) || state.comps[0]; }
 
@@ -301,7 +430,7 @@
       const bar = document.createElement('span'); bar.className = 'bar';
       const fill = document.createElement('i'); fill.style.width = c.score + '%'; bar.appendChild(fill);
       b.append(nm, sc, bar);
-      b.addEventListener('click', () => { state.selectedId = c.id; renderChips(); renderDetail(); });
+      b.addEventListener('click', () => { state.selectedId = c.id; state.okLatched = false; renderChips(); renderDetail(); });
       els.chips.appendChild(b);
     }
   }
@@ -419,13 +548,13 @@
     }
 
     // 偵測到的水平線（實際位置與傾斜）
-    if (a.horizon.valid && (c.guide === 'horizon' || c.guide === 'reflection' || Math.abs(a.horizon.angle) >= 1)) {
+    if (a.horizon.valid && (c.guide === 'horizon' || c.guide === 'reflection' || Math.abs(a.horizon.angle) >= 2)) {
       const t = Math.tan(a.horizon.angle * Math.PI / 180);
       const sh = srcSize();
       const ar = sh.w / sh.h;
       const p1 = T({ x: 0, y: a.horizon.y - t * 0.5 * ar });
       const p2 = T({ x: 1, y: a.horizon.y + t * 0.5 * ar });
-      const tilted = Math.abs(a.horizon.angle) >= 1;
+      const tilted = Math.abs(a.horizon.angle) >= 2;
       line(p1.x, p1.y, p2.x, p2.y, tilted ? '#ff8a5c' : 'rgba(255,255,255,0.8)', 1.6 * dpr, [3 * dpr, 4 * dpr]);
     }
 
@@ -455,49 +584,66 @@
     ctx.moveTo(bx + L, by + bh); ctx.lineTo(bx, by + bh); ctx.lineTo(bx, by + bh - L);
     ctx.stroke();
 
-    // 主體 → 目標位置的箭頭
-    let from, to, ok;
+    // 目標圓圈＋主體黃點：「移動手機，讓黃點進入圓圈」
+    let from, to;
     if (inCrop) {
       if (c.guide === 'horizon' || c.guide === 'reflection') return;
       const m = state.source === 'live' && state.facing === 'user';
       from = T({ x: S.cx, y: S.cy });
       to = { x: (m ? 1 - c.target.x : c.target.x) * W, y: c.target.y * H };
       if (c.guide === 'fill') to = from;
-      ok = c.cropResidual < 0.04;
+    } else if (c.guide === 'horizon' || c.guide === 'reflection') {
+      from = T({ x: 0.5, y: a.horizon.y }); to = T({ x: 0.5, y: c.horizonTarget });
     } else {
-      if (c.guide === 'horizon' || c.guide === 'reflection') {
-        from = T({ x: 0.5, y: a.horizon.y }); to = T({ x: 0.5, y: c.horizonTarget });
-      } else {
-        from = T({ x: S.cx, y: S.cy }); to = T(c.guide === 'fill' ? { x: 0.5, y: 0.5 } : c.target);
-      }
-      ok = c.aim.dist < 0.045;
+      from = T({ x: S.cx, y: S.cy }); to = T(c.guide === 'fill' ? { x: 0.5, y: 0.5 } : c.target);
     }
+    const ok = inCrop ? c.cropResidual < 0.04 : state.okLatched;
     const col = ok ? COL.ok : COL.focus;
-    // 目標點
-    ctx.beginPath(); ctx.arc(to.x, to.y, 11 * dpr, 0, Math.PI * 2);
-    ctx.strokeStyle = col; ctx.lineWidth = 2 * dpr; ctx.stroke();
-    ctx.beginPath(); ctx.arc(to.x, to.y, 2.5 * dpr, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
-    // 主體中心
-    ctx.beginPath(); ctx.arc(from.x, from.y, 4 * dpr, 0, Math.PI * 2); ctx.fillStyle = col; ctx.fill();
+    const R = 20 * dpr;
+    // 目標圓圈（半透明底，讓圓圈在亮背景上也看得清楚）
+    ctx.beginPath(); ctx.arc(to.x, to.y, R, 0, Math.PI * 2);
+    ctx.fillStyle = ok ? 'rgba(98,224,143,0.22)' : 'rgba(0,0,0,0.18)'; ctx.fill();
+    ctx.strokeStyle = col; ctx.lineWidth = 2.5 * dpr; ctx.stroke();
+    // 主體黃點（有黑邊）
+    ctx.beginPath(); ctx.arc(from.x, from.y, 7 * dpr, 0, Math.PI * 2);
+    ctx.fillStyle = col; ctx.fill(); ctx.strokeStyle = 'rgba(0,0,0,0.6)'; ctx.lineWidth = 1.5 * dpr; ctx.stroke();
+    // 黃點到圓圈的細虛線，只表示「這兩個要對齊」，沒有方向
     const d = Math.hypot(to.x - from.x, to.y - from.y);
-    if (d > 18 * dpr) {
+    if (d > R + 10 * dpr) {
       const ux = (to.x - from.x) / d, uy = (to.y - from.y) / d;
-      const ex = to.x - ux * 14 * dpr, ey = to.y - uy * 14 * dpr;
-      line(from.x + ux * 7 * dpr, from.y + uy * 7 * dpr, ex, ey, col, 2.2 * dpr);
-      const hs = 9 * dpr;
-      ctx.beginPath(); ctx.moveTo(ex + ux * 2, ey + uy * 2);
-      ctx.lineTo(ex - ux * hs - uy * hs * 0.6, ey - uy * hs + ux * hs * 0.6);
-      ctx.lineTo(ex - ux * hs + uy * hs * 0.6, ey - uy * hs - ux * hs * 0.6);
-      ctx.closePath(); ctx.fillStyle = col; ctx.fill();
+      line(from.x + ux * 10 * dpr, from.y + uy * 10 * dpr, to.x - ux * (R + 3 * dpr), to.y - uy * (R + 3 * dpr), 'rgba(255,255,255,0.55)', 1.2 * dpr, [3 * dpr, 4 * dpr]);
     }
+    // 畫面邊緣：手機要往哪移
+    if (!inCrop && !ok && state.source === 'live') drawPhoneArrows(c, W, H, dpr);
 
-    // 取景模式下，用虛線標出「拍下後會裁切成的範圍」
-    if (!inCrop && c.crop.w < 0.97) {
-      const k0 = T({ x: c.crop.x, y: c.crop.y }), k1 = T({ x: c.crop.x + c.crop.w, y: c.crop.y + c.crop.h });
-      ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1 * dpr; ctx.setLineDash([5 * dpr, 5 * dpr]);
-      ctx.strokeRect(Math.min(k0.x, k1.x), Math.min(k0.y, k1.y), Math.abs(k1.x - k0.x), Math.abs(k1.y - k0.y));
-      ctx.setLineDash([]);
-    }
+  }
+
+  /* 手機移動方向（以螢幕上看到的方向計算，前鏡頭的鏡像也正確） */
+  function phoneDir(c) {
+    const mirror = state.source === 'live' && state.facing === 'user';
+    const ddx = mirror ? -c.aim.dx : c.aim.dx, ddy = c.aim.dy; // 主體在螢幕上要移動的量
+    const thr = 0.045;
+    return { x: Math.abs(ddx) > thr ? -Math.sign(ddx) : 0, y: Math.abs(ddy) > thr ? -Math.sign(ddy) : 0, ddx, ddy };
+  }
+  function drawPhoneArrows(c, W, H, dpr) {
+    const p = phoneDir(c);
+    const draw = (cx, cy, ang, text) => {
+      ctx.save(); ctx.translate(cx, cy);
+      ctx.font = `700 ${13 * dpr}px "Noto Sans TC", system-ui, sans-serif`;
+      const tw = ctx.measureText(text).width;
+      const bw = tw + 44 * dpr, bh = 30 * dpr;
+      ctx.fillStyle = 'rgba(255,197,49,0.92)';
+      ctx.beginPath(); if (ctx.roundRect) ctx.roundRect(-bw / 2, -bh / 2, bw, bh, bh / 2); else ctx.rect(-bw / 2, -bh / 2, bw, bh); ctx.fill();
+      ctx.fillStyle = '#1d1606'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      const arrow = { 0: '→', 90: '↓', 180: '←', 270: '↑' }[ang];
+      ctx.fillText(ang === 0 || ang === 90 ? `${text} ${arrow}` : `${arrow} ${text}`, 0, 1 * dpr);
+      ctx.restore();
+    };
+    const m = 14 * dpr;
+    if (p.x > 0) draw(W - 62 * dpr, H / 2, 0, '手機往右');
+    if (p.x < 0) draw(62 * dpr, H / 2, 180, '手機往左');
+    if (p.y > 0) draw(W / 2, H - m - 18 * dpr, 90, '手機往下');
+    if (p.y < 0) draw(W / 2, m + 48 * dpr, 270, '手機往上');
   }
 
   function drawSpiral(c, W, H, dpr, inCrop) {
@@ -523,18 +669,28 @@
   let lastHint = '';
   function updateHint(c, a) {
     let text, ok = false;
+    const dist = c.aim.dist;
+    const sizeIssue = !!c.aim.sizeText;
+    // 遲滯：距離 < 0.04 進入「到位」，> 0.075 才離開，避免在邊界一直閃
+    state.okLatched = state.okLatched ? (dist < 0.075 && !sizeIssue) : (dist < 0.04 && !sizeIssue);
     if (state.mode === 'crop') {
       const keep = Math.round(c.crop.w * c.crop.h * 100);
       if (c.crop.w > 0.97) text = '不需裁切，直接拍就是這個構圖';
       else if (keep < 15) text = `只保留 ${keep}% 畫面，畫質會明顯下降，建議直接靠近拍`;
       else text = `拍下後裁成這樣（保留 ${keep}% 畫面）`;
       ok = c.cropResidual < 0.04;
-    } else if (state.source === 'still') {
-      text = c.aim.ok ? '構圖到位' : `拍攝時：${c.aim.text}`;
-      ok = c.aim.ok;
     } else {
-      ok = c.aim.ok;
-      text = ok ? '構圖到位，可以拍了' : c.aim.text;
+      ok = state.okLatched;
+      const p = phoneDir(c);
+      const parts = [];
+      if (p.x) parts.push(p.x > 0 ? '手機往右' : '手機往左');
+      if (p.y) parts.push(p.y > 0 ? '手機往下' : '手機往上');
+      if (c.aim.sizeText) parts.push(c.aim.sizeText);
+      const move = parts.join('、');
+      if (state.source === 'still') text = ok ? '構圖到位' : `拍攝時：${move || '微調一下位置'}`;
+      else if (ok) text = '構圖到位，可以拍了';
+      else if (performance.now() - state.lostAt < 2500) text = '主體跟丟了，請再點一次';
+      else text = (move || '微調一下') + '，讓黃點進入圓圈';
     }
     if (c.tips.length && !ok && state.mode === 'aim' && /傾斜/.test(c.tips[0])) text = '先把水平線轉正';
     const key = text + ok;
@@ -571,7 +727,13 @@
       cropUrl: crop.toDataURL('image/jpeg', 0.92),
       time: new Date(),
     };
-    showResult('crop');
+    // 取景提示模式：照著提示對好後拍，成片就是取景畫面；裁切預覽模式：成片是裁切版本
+    state.shot.primary = state.mode === 'crop' ? 'crop' : 'orig';
+    state.shot.hasCrop = k.w < 0.97;
+    els.showCrop.hidden = !state.shot.hasCrop;
+    els.showOrig.hidden = !state.shot.hasCrop;
+    els.saveOrig.hidden = !state.shot.hasCrop;
+    showResult(state.shot.primary);
     els.result.hidden = false;
     els.closeResult.focus();
   }
@@ -581,13 +743,17 @@
     if (!s) return;
     const isCrop = which === 'crop';
     els.resultImg.src = isCrop ? s.cropUrl : s.fullUrl;
+    els.saveCrop.dataset.which = isCrop ? 'crop' : 'orig';
+    els.saveCrop.textContent = '儲存這張照片';
+    els.saveOrig.dataset.which = isCrop ? 'orig' : 'crop';
+    els.saveOrig.textContent = isCrop ? '另存取景畫面' : '另存裁切版本';
     els.showCrop.classList.toggle('on', isCrop);
     els.showOrig.classList.toggle('on', !isCrop);
     els.resultTitle.textContent = `${s.comp.name}構圖`;
     const keep = Math.round(s.comp.crop.w * s.comp.crop.h * 100);
     els.resultMeta.textContent = isCrop
       ? `${s.crop.width} × ${s.crop.height} px · 保留 ${keep}% 畫面 · 適合度 ${s.comp.score}`
-      : `${s.full.width} × ${s.full.height} px · 原始畫面`;
+      : `${s.full.width} × ${s.full.height} px · 取景畫面`;
     els.toast.textContent = '';
   }
 
@@ -723,8 +889,8 @@
   });
   els.showCrop.addEventListener('click', () => showResult('crop'));
   els.showOrig.addEventListener('click', () => showResult('orig'));
-  els.saveCrop.addEventListener('click', () => save('crop'));
-  els.saveOrig.addEventListener('click', () => save('orig'));
+  els.saveCrop.addEventListener('click', () => save(els.saveCrop.dataset.which || 'crop'));
+  els.saveOrig.addEventListener('click', () => save(els.saveOrig.dataset.which || 'orig'));
   els.closeResult.addEventListener('click', () => { els.result.hidden = true; });
   document.addEventListener('keydown', (e) => {
     if (e.key === 'Escape' && !els.result.hidden) els.result.hidden = true;
