@@ -488,14 +488,18 @@
    * model 由 tools/testset.js fit 從標註照片產生；照片越多越準。
    */
   function classifyScene(a, model) {
-    const probs = {};
     const P = a.person;
-    if (P && P.faceSize >= 0.05) {
+    return classifyFeatures(sceneFeatures(a), P ? P.faceSize : 0, model);
+  }
+
+  // 依特徵向量與最大臉寬判斷（測試工具會快取特徵，直接呼叫這個）
+  function classifyFeatures(f, faceSize, model) {
+    const probs = {};
+    if (faceSize >= 0.05) {
       for (const k of Object.keys(SCENE_TYPES)) probs[k] = k === 'portrait' ? 0.9 : 0.1 / 4;
       return { type: 'portrait', conf: 0.9, probs };
     }
     if (!model || !model.centroids) return { type: 'object', conf: 0, probs: {} };
-    const f = sceneFeatures(a);
     const sd = model.std;
     // 只用模型挑選過的特徵（由 tools/testset.js fit 依標註照片選出）
     const use = (model.use || SCENE_FEATURES).map((n) => SCENE_FEATURES.indexOf(n)).filter((i) => i >= 0);
@@ -511,7 +515,7 @@
     let best = null;
     for (const k in probs) { probs[k] /= sum; if (!best || probs[k] > probs[best]) best = k; }
     // 有小人臉（例如風景中的人）時，人像也列為可能
-    if (P) { probs.portrait = 0.3; }
+    if (faceSize > 0) { probs.portrait = 0.3; }
     return { type: best, conf: probs[best], probs };
   }
 
@@ -990,7 +994,7 @@
     return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
+  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, classifyFeatures, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);

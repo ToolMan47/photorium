@@ -4,23 +4,27 @@
  *
  * 先用 tools/testset_prep.py 把照片轉成分析用的快取（testset/cache/*.rgba），再執行：
  *
- *   node tools/testset.js eval   [labels.csv] [cache]   類型判斷準確率（留一交叉驗證）與混淆矩陣
- *   node tools/testset.js fit    [labels.csv] [cache]   用全部標註照片重新產生 web/src/scene-model.js
- *   node tools/testset.js report [labels.csv] [cache]   每張照片的判斷結果與前三名構圖
+ *   node tools/testset.js features   分析照片、把特徵存到 testset/cache/features.json
+ *                                    （每次最多約 2 分鐘，沒做完會提示再執行一次；已分析過的會略過）
+ *   node tools/testset.js eval       類型判斷準確率（留一交叉驗證）、信心度門檻、混淆矩陣
+ *   node tools/testset.js fit        挑選特徵並重新產生 web/src/scene-model.js
+ *   node tools/testset.js report     每張照片的判斷結果
  *
- * 預設 labels.csv = testset/labels.csv，cache = testset/cache
+ * eval、fit、report 只讀取 features.json，速度很快；新增照片後先跑 features。
+ * 可加參數：[labels.csv] [cache 資料夾]，預設 testset/labels.csv、testset/cache
  */
 'use strict';
 const fs = require('fs'), path = require('path');
 const ROOT = path.join(__dirname, '..');
 const E = require(path.join(ROOT, 'web/src/engine.js'));
-const F = require(path.join(ROOT, 'test/face-load.js'));
 
 const [cmd = 'eval', labelsPath = path.join(ROOT, 'testset/labels.csv'), cacheDir = path.join(ROOT, 'testset/cache')] = process.argv.slice(2);
+const FEAT_FILE = path.join(cacheDir, 'features.json');
+const TIME_BUDGET_MS = 120000;
 
 function readLabels(p) {
-  const rows = fs.readFileSync(p, 'utf8').trim().split(/\r?\n/).slice(1);
-  return rows.map((r) => { const [file, type, note = ''] = r.split(','); return { file: file.trim(), type: type.trim(), note }; })
+  const rows = fs.readFileSync(p, 'utf8').replace(/^﻿/, '').trim().split(/\r?\n/).slice(1);
+  return rows.map((r) => { const [file, type, ...note] = r.split(','); return { file: (file || '').trim(), type: (type || '').trim(), note: note.join(',') }; })
     .filter((r) => r.file && E.SCENE_TYPES[r.type]);
 }
 
@@ -33,8 +37,8 @@ function loadRgba(file) {
 }
 
 // 縮到寬 200 px（和網頁版分析照片時一樣）
-function downscale(img, long) {
-  const k = long / img.width;
+function downscale(img, width) {
+  const k = width / img.width;
   const w = Math.max(8, Math.round(img.width * k)), h = Math.max(8, Math.round(img.height * k));
   const out = new Uint8ClampedArray(w * h * 4);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
@@ -45,43 +49,39 @@ function downscale(img, long) {
   return { width: w, height: h, data: out };
 }
 
-function analyzeFile(file) {
-  const img = loadRgba(file);
-  if (!img) return null;
-  const faces = F.detect(img); // 快取是長邊 640 px，和網頁版照片模式相同
-  const small = downscale(img, 200);
-  const a = E.analyze(small, { faces });
-  a._img = small;
-  return a;
+function loadFeatures() {
+  try { return JSON.parse(fs.readFileSync(FEAT_FILE, 'utf8')); } catch (e) { return {}; }
 }
 
-// 留一交叉驗證：用 use 這組特徵時，有幾張判斷正確（人像由人臉決定，不在此計算）
-function looScore(samples, use) {
-  let ok = 0;
-  for (let i = 0; i < samples.length; i++) {
-    const s = samples[i];
-    if (s.type === 'portrait' || (s.a.person && s.a.person.faceSize >= 0.05)) continue;
-    const m = fitModel(samples.filter((_, j) => j !== i), use);
-    if (E.classifyScene(s.a, m).type === s.type) ok++;
+function cmdFeatures(labels) {
+  const F = require(path.join(ROOT, 'test/face-load.js'));
+  const cache = loadFeatures();
+  // 特徵定義改了（引擎更新）就全部重算
+  const sig = E.SCENE_FEATURES.join(',');
+  if (cache.__sig !== sig) { for (const k of Object.keys(cache)) delete cache[k]; cache.__sig = sig; }
+  const t0 = Date.now();
+  let done = 0, left = 0, missing = 0;
+  for (const L of labels) {
+    if (cache[L.file]) continue;
+    if (Date.now() - t0 > TIME_BUDGET_MS) { left++; continue; }
+    const img = loadRgba(L.file);
+    if (!img) { missing++; continue; }
+    const faces = F.detect(img); // 快取是長邊 640 px，和網頁版照片模式相同
+    const a = E.analyze(downscale(img, 200), { faces });
+    cache[L.file] = { f: E.sceneFeatures(a).map((v) => +v.toFixed(4)), face: a.person ? +a.person.faceSize.toFixed(3) : 0 };
+    done++;
+    if (done % 20 === 0) fs.writeFileSync(FEAT_FILE, JSON.stringify(cache));
   }
-  return ok;
+  fs.writeFileSync(FEAT_FILE, JSON.stringify(cache));
+  console.log(`分析 ${done} 張${left ? `，還有 ${left} 張沒做完，請再執行一次 features` : '，全部完成'}${missing ? `；${missing} 張沒有快取（先跑 testset_prep.py）` : ''}`);
 }
 
-// 貪婪前向挑選特徵：每次加入最能提高準確率的特徵，直到不再進步
-function selectFeatures(samples) {
-  const names = E.SCENE_FEATURES;
-  let use = [], cur = -1;
-  for (;;) {
-    let bestName = null, bestV = cur;
-    for (const n of names) {
-      if (use.includes(n)) continue;
-      const v = looScore(samples, [...use, n]);
-      if (v > bestV) { bestV = v; bestName = n; }
-    }
-    if (!bestName) break;
-    use.push(bestName); cur = bestV;
-  }
-  return use;
+function samplesFrom(labels) {
+  const cache = loadFeatures();
+  const out = [], miss = [];
+  for (const L of labels) { const c = cache[L.file]; if (c) out.push({ ...L, f: c.f, face: c.face }); else miss.push(L.file); }
+  if (miss.length) console.warn(`有 ${miss.length} 張還沒分析，先執行 node tools/testset.js features`);
+  return out;
 }
 
 function fitModel(samples, use) {
@@ -103,17 +103,38 @@ function fitModel(samples, use) {
   return { features: E.SCENE_FEATURES, use: use || E.SCENE_FEATURES, centroids, std, counts, temperature: 0.5 };
 }
 
+// 留一交叉驗證：每次拿掉一張，用其他照片產生模型，再判斷拿掉的那張
+function loo(samples, use) {
+  return samples.map((s, i) => {
+    const m = fitModel(samples.filter((_, j) => j !== i), use);
+    return { s, r: E.classifyFeatures(s.f, s.face, m) };
+  });
+}
+const looScore = (samples, use) => loo(samples, use).filter((x) => x.s.type !== 'portrait' && x.s.face < 0.05 && x.r.type === x.s.type).length;
+
+// 貪婪前向挑選特徵：每次加入最能提高準確率的特徵，直到不再進步
+function selectFeatures(samples) {
+  let use = [], cur = -1;
+  for (;;) {
+    let bestName = null, bestV = cur;
+    for (const n of E.SCENE_FEATURES) {
+      if (use.includes(n)) continue;
+      const v = looScore(samples, [...use, n]);
+      if (v > bestV) { bestV = v; bestName = n; }
+    }
+    if (!bestName) break;
+    use.push(bestName); cur = bestV;
+  }
+  return use;
+}
+
 const round = (a) => a.map((v) => +v.toFixed(4));
 
 function main() {
   const labels = readLabels(labelsPath);
-  const samples = [];
-  for (const L of labels) {
-    const a = analyzeFile(L.file);
-    if (!a) { console.warn('找不到快取，略過：', L.file); continue; }
-    samples.push({ ...L, a, img: a._img, f: E.sceneFeatures(a) });
-  }
-  if (!samples.length) { console.error('沒有可用的照片。請先執行 tools/testset_prep.py'); process.exit(1); }
+  if (cmd === 'features') return cmdFeatures(labels);
+  const samples = samplesFrom(labels);
+  if (!samples.length) { console.error('沒有可用的照片：先執行 tools/testset_prep.py，再執行 node tools/testset.js features'); process.exit(1); }
   const types = Object.keys(E.SCENE_TYPES);
 
   if (cmd === 'fit') {
@@ -127,38 +148,24 @@ function main() {
   }
 
   if (cmd === 'eval' || cmd === 'report') {
-    // 留一交叉驗證：每次拿掉一張，用其他照片產生模型，再判斷拿掉的那張
+    let use;
+    try { delete require.cache[require.resolve(path.join(ROOT, 'web/src/scene-model.js'))]; use = require(path.join(ROOT, 'web/src/scene-model.js')).use; } catch (e) { use = undefined; }
+    const res = loo(samples, use);
     const conf = {}; types.forEach((t) => { conf[t] = {}; types.forEach((u) => { conf[t][u] = 0; }); });
     let ok = 0;
-    const rows = [];
-    // 使用目前 scene-model.js 挑選的特徵（若有）
-    let use;
-    try { use = require(path.join(ROOT, 'web/src/scene-model.js')).use; } catch (e) { use = undefined; }
-    const calib = [];
-    for (let i = 0; i < samples.length; i++) {
-      const rest = samples.filter((_, j) => j !== i);
-      const m = fitModel(rest, use);
-      const s = samples[i];
-      const r = E.classifyScene(s.a, m);
-      conf[s.type][r.type]++;
-      if (r.type === s.type) ok++;
-      calib.push({ conf: r.conf, ok: r.type === s.type });
-      rows.push({ file: s.file, want: s.type, got: r.type, conf: r.conf, note: s.note, comps: E.suggest(s.type === 'portrait' || E.PROFILES[s.type].faces ? s.a : E.analyze(s.img, { faces: [] }), { type: s.type }).slice(0, 3).map((c) => c.name + c.score).join(' ') });
-    }
+    for (const { s, r } of res) { conf[s.type][r.type]++; if (r.type === s.type) ok++; }
     if (cmd === 'report') {
-      for (const r of rows) console.log(`${r.file}\t標註 ${E.SCENE_TYPES[r.want]}\t判斷 ${E.SCENE_TYPES[r.got]} ${(r.conf * 100).toFixed(0)}%\t${r.want === r.got ? '✓' : '✗'}\t${r.comps}\t${r.note}`);
+      for (const { s, r } of res) console.log(`${s.file}\t標註 ${E.SCENE_TYPES[s.type]}\t判斷 ${E.SCENE_TYPES[r.type]} ${(r.conf * 100).toFixed(0)}%\t${s.type === r.type ? '✓' : '✗'}\t${s.note}`);
       console.log('');
     }
     console.log(`使用的特徵：${(use || E.SCENE_FEATURES).join('、')}`);
     console.log(`類型判斷準確率（留一交叉驗證）：${ok}/${samples.length} = ${(ok / samples.length * 100).toFixed(0)}%\n`);
-    // 信心度門檻：信心度 ≥ t 的判斷有多少比例正確，用來決定自動模式何時才套用判斷結果
     console.log('信心度門檻    判斷張數    正確率');
     for (const t of [0.3, 0.4, 0.5, 0.6, 0.7, 0.8]) {
-      const sel = calib.filter((c) => c.conf >= t);
-      if (sel.length) console.log(`  ≥ ${t.toFixed(1)}       ${String(sel.length).padStart(3)}        ${(sel.filter((c) => c.ok).length / sel.length * 100).toFixed(0)}%`);
+      const sel = res.filter((x) => x.r.conf >= t);
+      if (sel.length) console.log(`  ≥ ${t.toFixed(1)}       ${String(sel.length).padStart(3)}        ${(sel.filter((x) => x.r.type === x.s.type).length / sel.length * 100).toFixed(0)}%`);
     }
-    console.log('');
-    console.log('混淆矩陣（列 = 標註，欄 = 判斷）');
+    console.log('\n混淆矩陣（列 = 標註，欄 = 判斷）');
     console.log('        ' + types.map((t) => E.SCENE_TYPES[t]).join('  '));
     for (const t of types) {
       const n = types.reduce((a, u) => a + conf[t][u], 0);

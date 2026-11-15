@@ -466,10 +466,10 @@
    * 自動判斷拍攝類型：
    *  - 照片：判斷一次
    *  - 即時：機率做平滑；新類型要連續領先約 1.5 秒才切換，避免一直跳
-   *  - 信心度低於 0.7 時不套用（用一般邏輯），並提示使用者直接選類型
-   *    （依 40 張實拍照片，信心度 ≥ 0.7 的判斷約 67% 正確；見 tools/testset.js eval）
+   *  - 信心度低於 0.6 時不套用（用一般邏輯），並提示使用者直接選類型
+   *    （依 250 張實拍照片，信心度 ≥ 0.6 的判斷約 79% 正確；見 tools/testset.js eval）
    */
-  const AUTO_MIN_CONF = 0.7;
+  const AUTO_MIN_CONF = 0.6;
   function resolveScene(a, isStill) {
     const sc = state.scene;
     if (state.sceneMode !== 'auto') { setSceneType(state.sceneMode); sc.guess = null; return sc.type; }
@@ -486,15 +486,17 @@
       sc.cand = best;
       if (!sc.guess || sc.candCount >= 7) { sc.guess = best; sc.conf = conf; sc.candCount = 0; }
     }
-    setSceneType(sc.guess && sc.conf >= AUTO_MIN_CONF ? sc.guess : 'general');
+    // 遲滯：信心度 ≥ 0.6 才套用；已套用的類型要降到 0.5 以下才取消，避免在門檻附近來回切換
+    const keep = sc.type === sc.guess && sc.conf >= AUTO_MIN_CONF - 0.1;
+    setSceneType(sc.guess && (sc.conf >= AUTO_MIN_CONF || keep) ? sc.guess : 'general');
     return sc.type;
   }
   function setSceneType(t) {
     const sc = state.scene;
     if (sc.type === t) return;
     sc.type = t;
-    // 換類型 → 構圖組合不同，目標重新選
-    state.frozen = null; state.prevTargets = {}; state.lastChipRender = 0; state.okLatched = false;
+    // 換類型 → 構圖組合可能不同；選中的構圖如果還在，就保留它的固定目標（在 analyzeNow 判斷）
+    state.prevTargets = {}; state.lastChipRender = 0;
     renderTypes();
   }
 

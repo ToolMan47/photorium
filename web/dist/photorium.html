@@ -769,14 +769,18 @@ button { cursor: pointer; }
    * model 由 tools/testset.js fit 從標註照片產生；照片越多越準。
    */
   function classifyScene(a, model) {
-    const probs = {};
     const P = a.person;
-    if (P && P.faceSize >= 0.05) {
+    return classifyFeatures(sceneFeatures(a), P ? P.faceSize : 0, model);
+  }
+
+  // 依特徵向量與最大臉寬判斷（測試工具會快取特徵，直接呼叫這個）
+  function classifyFeatures(f, faceSize, model) {
+    const probs = {};
+    if (faceSize >= 0.05) {
       for (const k of Object.keys(SCENE_TYPES)) probs[k] = k === 'portrait' ? 0.9 : 0.1 / 4;
       return { type: 'portrait', conf: 0.9, probs };
     }
     if (!model || !model.centroids) return { type: 'object', conf: 0, probs: {} };
-    const f = sceneFeatures(a);
     const sd = model.std;
     // 只用模型挑選過的特徵（由 tools/testset.js fit 依標註照片選出）
     const use = (model.use || SCENE_FEATURES).map((n) => SCENE_FEATURES.indexOf(n)).filter((i) => i >= 0);
@@ -792,7 +796,7 @@ button { cursor: pointer; }
     let best = null;
     for (const k in probs) { probs[k] /= sum; if (!best || probs[k] > probs[best]) best = k; }
     // 有小人臉（例如風景中的人）時，人像也列為可能
-    if (P) { probs.portrait = 0.3; }
+    if (faceSize > 0) { probs.portrait = 0.3; }
     return { type: best, conf: probs[best], probs };
   }
 
@@ -1271,7 +1275,7 @@ button { cursor: pointer; }
     return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
+  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, classifyFeatures, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -1488,8 +1492,8 @@ button { cursor: pointer; }
 </script>
 <script>
 /* 由 tools/testset.js fit 自動產生，請勿手動編輯。
- * 標註照片：40 張（美食 2、風景 13、延伸 12、物品 9；人像另由人臉判斷）
- * 產生時間：2026-11-15T15:36:13.280Z
+ * 標註照片：250 張（美食 27、風景 57、延伸 72、物品 60；人像另由人臉判斷）
+ * 產生時間：2026-11-15T16:11:00.824Z
  */
 (function (root) {
   const model = {
@@ -1510,99 +1514,101 @@ button { cursor: pointer; }
       "contrast"
     ],
     "use": [
-      "emptiness",
+      "brightness",
+      "warmCenter",
       "linesDiag",
-      "vanishInside",
-      "subjectConf",
-      "edgeDensity"
+      "linesV",
+      "subjectArea",
+      "vanish",
+      "vanishInside"
     ],
     "centroids": {
       "food": [
-        0,
-        0.2795,
-        0.2468,
-        0.4738,
-        0.1117,
-        0,
-        0.3833,
-        0.2429,
-        0.0304,
-        0.7794,
-        0.9246,
-        0.3002,
-        0.5044,
-        0.5272
+        0.1852,
+        0.3134,
+        0.1914,
+        0.4952,
+        0.2419,
+        0.02,
+        0.4513,
+        0.3332,
+        0.0449,
+        0.84,
+        0.88,
+        0.425,
+        0.4838,
+        0.4489
       ],
       "landscape": [
-        0.3846,
-        0.2881,
-        0.2647,
-        0.4472,
-        0.1429,
-        0.0676,
-        0.544,
-        0.6069,
-        0.2058,
-        0.421,
-        0.8618,
-        0.0768,
-        0.2803,
-        0.3656
+        0.3333,
+        0.3224,
+        0.2293,
+        0.4483,
+        0.1482,
+        0.0916,
+        0.5183,
+        0.5441,
+        0.2027,
+        0.513,
+        0.8802,
+        0.0891,
+        0.3183,
+        0.387
       ],
       "perspective": [
-        0.1667,
-        0.3462,
-        0.2849,
-        0.3688,
-        0.1938,
-        0.0812,
-        0.4673,
-        0.5284,
-        0.1457,
-        0.5997,
-        0.9174,
-        0.2292,
-        0.3336,
-        0.3902
+        0.2222,
+        0.326,
+        0.2972,
+        0.3768,
+        0.2147,
+        0.0881,
+        0.4851,
+        0.4503,
+        0.1564,
+        0.5929,
+        0.9103,
+        0.1581,
+        0.3813,
+        0.4499
       ],
       "object": [
-        0.2222,
-        0.3811,
-        0.3217,
-        0.2972,
-        0.1981,
-        0.0223,
-        0.4033,
-        0.3691,
-        0.1694,
-        0.8715,
-        0.9249,
-        0.2915,
-        0.4085,
-        0.4219
+        0.2667,
+        0.3504,
+        0.2718,
+        0.3778,
+        0.205,
+        0.0561,
+        0.4434,
+        0.3689,
+        0.1685,
+        0.6004,
+        0.9215,
+        0.2519,
+        0.4239,
+        0.4356
       ]
     },
     "std": [
-      0.433,
-      0.1304,
-      0.1229,
-      0.0947,
-      0.0852,
-      0.0777,
-      0.1309,
-      0.2003,
-      0.1146,
-      0.329,
-      0.0799,
-      0.2094,
-      0.1168,
-      0.1174
+      0.4382,
+      0.113,
+      0.1057,
+      0.0944,
+      0.1047,
+      0.1064,
+      0.129,
+      0.1851,
+      0.1259,
+      0.3284,
+      0.0788,
+      0.1968,
+      0.1076,
+      0.1012
     ],
     "counts": {
-      "food": 2,
-      "landscape": 13,
-      "perspective": 12,
-      "object": 9
+      "food": 27,
+      "landscape": 57,
+      "perspective": 72,
+      "object": 60
     },
     "temperature": 0.5
   };
@@ -2080,10 +2086,10 @@ button { cursor: pointer; }
    * 自動判斷拍攝類型：
    *  - 照片：判斷一次
    *  - 即時：機率做平滑；新類型要連續領先約 1.5 秒才切換，避免一直跳
-   *  - 信心度低於 0.7 時不套用（用一般邏輯），並提示使用者直接選類型
-   *    （依 40 張實拍照片，信心度 ≥ 0.7 的判斷約 67% 正確；見 tools/testset.js eval）
+   *  - 信心度低於 0.6 時不套用（用一般邏輯），並提示使用者直接選類型
+   *    （依 250 張實拍照片，信心度 ≥ 0.6 的判斷約 79% 正確；見 tools/testset.js eval）
    */
-  const AUTO_MIN_CONF = 0.7;
+  const AUTO_MIN_CONF = 0.6;
   function resolveScene(a, isStill) {
     const sc = state.scene;
     if (state.sceneMode !== 'auto') { setSceneType(state.sceneMode); sc.guess = null; return sc.type; }
@@ -2100,15 +2106,17 @@ button { cursor: pointer; }
       sc.cand = best;
       if (!sc.guess || sc.candCount >= 7) { sc.guess = best; sc.conf = conf; sc.candCount = 0; }
     }
-    setSceneType(sc.guess && sc.conf >= AUTO_MIN_CONF ? sc.guess : 'general');
+    // 遲滯：信心度 ≥ 0.6 才套用；已套用的類型要降到 0.5 以下才取消，避免在門檻附近來回切換
+    const keep = sc.type === sc.guess && sc.conf >= AUTO_MIN_CONF - 0.1;
+    setSceneType(sc.guess && (sc.conf >= AUTO_MIN_CONF || keep) ? sc.guess : 'general');
     return sc.type;
   }
   function setSceneType(t) {
     const sc = state.scene;
     if (sc.type === t) return;
     sc.type = t;
-    // 換類型 → 構圖組合不同，目標重新選
-    state.frozen = null; state.prevTargets = {}; state.lastChipRender = 0; state.okLatched = false;
+    // 換類型 → 構圖組合可能不同；選中的構圖如果還在，就保留它的固定目標（在 analyzeNow 判斷）
+    state.prevTargets = {}; state.lastChipRender = 0;
     renderTypes();
   }
 
