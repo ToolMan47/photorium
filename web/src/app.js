@@ -291,12 +291,13 @@
     const lockedFace = state.lock && state.lock.type === 'face';
     if (state.sceneMode !== 'auto' && !E.PROFILES[state.sceneMode].faces && !lockedFace) faces = [];
     opts.faces = faces;
+    opts.food = state.sceneMode === 'food';
     state.lastGray = data;
     let a = E.analyze(data, opts);
     // 拍攝類型：手動選的直接用；自動模式依判斷結果（有把握才套用）
     const type = resolveScene(a, isStill);
-    if (state.sceneMode === 'auto' && !E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) {
-      a = E.analyze(data, Object.assign({}, opts, { faces: [] }));
+    if (state.sceneMode === 'auto' && ((!E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) || (type === 'food' && !opts.food))) {
+      a = E.analyze(data, Object.assign({}, opts, { faces: lockedFace ? opts.faces : (E.PROFILES[type].faces ? opts.faces : []), food: type === 'food' }));
     }
     // 自動偵測的主體突然跳到很遠的地方：要連續出現約 1 秒才採用，否則沿用原本的主體
     if (!isStill && state.smooth && !a.subject.kind && !state.smooth.subject.kind) {
@@ -322,7 +323,7 @@
     }
     state.smooth = a;
     state.analysis = a;
-    const comps = E.suggest(a, { prev: state.prevTargets, type });
+    const comps = E.suggest(a, { prev: state.prevTargets, type, tilt: state.source === 'live' ? currentTilt() : null });
     for (const c of comps) state.prevTargets[c.id] = c.pick;
     const now = performance.now();
     // 選中的構圖暫時從清單消失時（分數邊界），2.5 秒內沿用它，不要自動換掉
@@ -345,7 +346,7 @@
       const hz = cur.guide === 'horizon' || cur.guide === 'reflection';
       const from = hz ? { x: 0.5, y: a.horizon.y } : { x: S.cx, y: S.cy };
       const to = hz ? { x: 0.5, y: cur.horizonTarget } : (cur.guide === 'fill' ? { x: 0.5, y: 0.5 } : cur.target);
-      cur.aim = E.aimHint(from, to, S, cur.size);
+      cur.aim = E.aimHint(from, to, S, cur.size, cur.extra);
       if (comps.includes(cur)) state.selSnap = { id: cur.id, comp: cur, at: now };
     }
     state.comps = comps;
@@ -353,6 +354,14 @@
     const ids = comps.slice(0, 5).map((c) => c.id).join(',');
     if (isStill || (ids !== state.chipIds && now - state.lastChipRender > 3000) || !state.lastChipRender) {
       renderChips(); state.lastChipRender = now; state.chipIds = ids;
+    } else {
+      // 不重排，只更新分數
+      for (const b of els.chips.children) {
+        const c = comps.find((x) => x.id === b.dataset.id);
+        if (!c) continue;
+        b.querySelector('.sc').textContent = c.score;
+        b.querySelector('.bar i').style.width = c.score + '%';
+      }
     }
     renderDetail();
     renderReadout();
@@ -516,7 +525,29 @@
     els.typeTip.textContent = tip;
   }
 
+  /*
+   * 手機傾斜：鏡頭和「正下方」的夾角。手機平放、鏡頭朝下 = 0°（俯拍）；直立拿著 = 90°。
+   * 由 deviceorientation 的 beta、gamma 算出：cos(夾角) = cos(beta)·cos(gamma)。
+   * iPhone 需要使用者同意（在點選「美食」時詢問）；沒有資料時回傳 null，改用盤子形狀估計。
+   */
+  const tiltState = { deg: null, at: 0, asked: false };
+  window.addEventListener('deviceorientation', (e) => {
+    if (e.beta == null || e.gamma == null) return;
+    const r = Math.PI / 180;
+    const deg = Math.acos(Math.max(-1, Math.min(1, Math.cos(e.beta * r) * Math.cos(e.gamma * r)))) / r;
+    tiltState.deg = tiltState.deg == null ? deg : tiltState.deg * 0.7 + deg * 0.3;
+    tiltState.at = performance.now();
+  });
+  function currentTilt() { return performance.now() - tiltState.at < 1000 ? tiltState.deg : null; }
+  function askTiltPermission() {
+    if (tiltState.asked) return;
+    tiltState.asked = true;
+    const D = window.DeviceOrientationEvent;
+    if (D && typeof D.requestPermission === 'function') D.requestPermission().catch(() => { /* 使用者拒絕：改用盤子形狀估計 */ });
+  }
+
   function setSceneMode(m) {
+    if (m === 'food') askTiltPermission(); // 這裡是使用者點擊，iPhone 才允許詢問
     state.sceneMode = m;
     try { localStorage.setItem('photorium.sceneMode', m); } catch (e) { /* 無法儲存時忽略 */ }
     state.scene.ema = null; state.scene.guess = null; state.scene.candCount = 0;
@@ -539,7 +570,10 @@
     const sc = state.scene;
     const kind = sc.type !== 'general' ? E.SCENE_TYPES[sc.type] : '未分類';
     const guess = state.sceneMode === 'auto' && sc.guess ? `（猜 ${E.SCENE_TYPES[sc.guess]} ${(sc.conf * 100).toFixed(0)}%）` : '';
-    els.readout.textContent = `${kind}${guess} · ${who} · 水平線 ${hz}`;
+    const tilt = state.source === 'live' ? currentTilt() : null;
+    const angle = tilt != null ? ` · 角度 ${Math.round(tilt)}°` : (s.dish ? ` · 盤子角度約 ${Math.round(Math.acos(Math.min(1, s.dish.ratio)) * 180 / Math.PI)}°` : '');
+    const who2 = s.kind === 'dish' ? '盤子' : s.kind === 'food' ? '食物' : who;
+    els.readout.textContent = `${kind}${guess} · ${who2}${angle} · 水平線 ${hz}`;
   }
 
   function renderChips() {
@@ -634,7 +668,7 @@
       return;
     }
     const D = state.disp;
-    const dt = Math.min(0.1, (now - D.t) / 1000); D.t = now;
+    const dt = Math.min(0.04, (now - D.t) / 1000); D.t = now; // 卡頓的那一格也只走一小步
     const k = 1 - Math.exp(-dt / 0.15);
     const ease = (p, q) => { p.x += (q.x - p.x) * k; p.y += (q.y - p.y) * k; };
     ease(D.from, from); ease(D.to, to);
@@ -727,7 +761,8 @@
       ok = c.cropResidual < 0.04;
     } else {
       ok = state.okLatched;
-      const move = phoneDir(c) || c.aim.sizeText || '';
+      const angleHint = (c.extra || []).find((t) => /°/.test(t));
+      const move = angleHint || phoneDir(c) || c.aim.sizeText || '';
       if (state.source === 'still') text = ok ? '構圖到位' : `拍攝時：${move.replace(/^[→←↑↓] /, '') || '微調位置'}`;
       else if (ok) text = '構圖到位，可以拍了';
       else if (performance.now() - state.lostAt < 2500) text = '主體跟丟了，請再點一次';

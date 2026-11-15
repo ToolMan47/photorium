@@ -417,8 +417,21 @@ button { cursor: pointer; }
     const Sal = normalize(boxBlur(S, w, h, 2));
     const person = opts.faces && opts.faces.length ? buildPerson(opts.faces) : null;
     const salSubject = findSubject(Sal, w, h);
+    const dishes = opts.food ? findDishes(d, w, h, mag) : null;
     let subject;
+    const mainDish = dishes && dishes.length && dishes[0].area >= 0.04 ? dishes[0] : null;
     if (person) subject = person;
+    else if (opts.subject) subject = null; // 點選的主體優先（下面處理）
+    else if (mainDish) {
+      // 美食：以主要的盤子／碗為主體（構圖時整個盤子一起考慮）
+      const b = { x: clamp(mainDish.cx - mainDish.rx, 0, 1), y: clamp(mainDish.cy - mainDish.ry, 0, 1) };
+      b.w = clamp(mainDish.cx + mainDish.rx, 0, 1) - b.x; b.h = clamp(mainDish.cy + mainDish.ry, 0, 1) - b.y;
+      subject = { kind: 'dish', cx: mainDish.cx, cy: mainDish.cy, box: b, area: b.w * b.h, conf: 1, dish: mainDish };
+    } else if (dishes && dishes.foodBlob) {
+      const fb = dishes.foodBlob;
+      subject = { kind: 'food', cx: fb.cx, cy: fb.cy, box: fb.box, area: fb.box.w * fb.box.h, conf: 0.7 };
+    }
+    if (subject) { /* 已決定 */ }
     else if (opts.subject) {
       // 使用者點選並追蹤中的主體
       const b = opts.subject.box;
@@ -457,6 +470,7 @@ button { cursor: pointer; }
       brightness: mL.mean / 255,
       contrast: mL.std / 128,
       salSubject,
+      dishes,
       stats: sceneStats(d, Lb, mag, w, h),
       vanish: vanishingPoint(gx, gy, mag, w, h),
     };
@@ -656,6 +670,174 @@ button { cursor: pointer; }
     };
   }
 
+  // ---------- 盤子偵測（美食模式） ----------
+  /*
+   * 盤子、碗大多是淺色、低彩度的陶瓷。做法：
+   *  1. 標出「盤子色」像素：亮、顏色淡
+   *  2. 補洞：盤子裡的食物不是盤子色，會變成洞；從畫面邊緣走不到的非盤子色區域就是洞，補起來
+   *  3. 連通區域 → 用二階動差算出等效橢圓（中心、長短軸、角度）
+   *  4. 區域和橢圓重疊夠高（IoU）才算盤子，可以排除淺色桌面、牆壁
+   * 回傳的橢圓以正規化座標表示；ratio = 短軸／長軸（像素尺度），接近 1 代表接近正上方俯拍。
+   */
+  function findDishes(d, w, h, mag) {
+    const n = w * h;
+    // 白平衡（灰色世界假設）：室內暖光下白盤子會偏黃，先把整體色偏拉回來
+    let mr = 0, mg = 0, mb = 0;
+    for (let j = 0; j < n * 4; j += 4) { mr += d[j]; mg += d[j + 1]; mb += d[j + 2]; }
+    const avg = (mr + mg + mb) / 3 || 1;
+    const kr = avg / (mr || 1), kg = avg / (mg || 1), kb = avg / (mb || 1);
+    const lum = new Float32Array(n), satA = new Float32Array(n);
+    for (let i = 0, j = 0; i < n; i++, j += 4) {
+      const r = d[j] * kr, g = d[j + 1] * kg, b = d[j + 2] * kb;
+      const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+      lum[i] = (r + g + b) / 3; satA[i] = mx ? (mx - mn) / mx : 0;
+    }
+    // 亮度門檻依畫面調整：至少比畫面中位數亮
+    const sorted = Array.from(lum).sort((a, b) => a - b);
+    const lThr = Math.max(105, sorted[Math.floor(n * 0.55)]);
+    let mMean = 0; for (let i = 0; i < n; i++) mMean += mag[i]; mMean /= n;
+    const plate = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      // 強邊緣（盤緣、陰影）不算盤子色，讓相鄰的白色物體分開
+      if (lum[i] > lThr && satA[i] < 0.22 && mag[i] < mMean * 2.5) plate[i] = 1;
+    }
+    if (findDishes.debug) findDishes.debug.plate = plate;
+    // 盤緣有強邊緣的地方被排除，會留下小缺口；補洞前先把盤子色區域加粗 2 px，封住缺口
+    const wall = new Uint8Array(n);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (!plate[y * w + x]) continue;
+      for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+        const yy = y + dy, xx = x + dx;
+        if (yy >= 0 && yy < h && xx >= 0 && xx < w) wall[yy * w + xx] = 1;
+      }
+    }
+    // 補洞：從邊緣開始，把能走到的非盤子像素標成「外面」
+    const outside = new Uint8Array(n), stack = [];
+    const push = (i) => { if (!wall[i] && !outside[i]) { outside[i] = 1; stack.push(i); } };
+    for (let x = 0; x < w; x++) { push(x); push((h - 1) * w + x); }
+    for (let y = 0; y < h; y++) { push(y * w); push(y * w + w - 1); }
+    while (stack.length) {
+      const i = stack.pop(), x = i % w, y = (i / w) | 0;
+      if (x > 0) push(i - 1); if (x < w - 1) push(i + 1);
+      if (y > 0) push(i - w); if (y < h - 1) push(i + w);
+    }
+    const filled = new Uint8Array(n);
+    for (let i = 0; i < n; i++) filled[i] = wall[i] || !outside[i] ? 1 : 0;
+    if (findDishes.debug) findDishes.debug.filled = filled;
+    // 到「非盤子區域」的距離（chamfer 距離轉換）：用來逐步收縮，切斷和桌面、紙巾之間的細窄連接
+    const dist = new Float32Array(n);
+    for (let i = 0; i < n; i++) dist[i] = filled[i] ? 1e9 : 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x; if (!dist[i]) continue;
+      if (x === 0 || y === 0 || x === w - 1 || y === h - 1) { dist[i] = 1; continue; }
+      dist[i] = Math.min(dist[i], dist[i - 1] + 1, dist[i - w] + 1, dist[i - w - 1] + 1.4, dist[i - w + 1] + 1.4);
+    }
+    for (let y = h - 1; y >= 0; y--) for (let x = w - 1; x >= 0; x--) {
+      const i = y * w + x; if (!dist[i]) continue;
+      if (x < w - 1) dist[i] = Math.min(dist[i], dist[i + 1] + 1);
+      if (y < h - 1) { dist[i] = Math.min(dist[i], dist[i + w] + 1); if (x < w - 1) dist[i] = Math.min(dist[i], dist[i + w + 1] + 1.4); if (x > 0) dist[i] = Math.min(dist[i], dist[i + w - 1] + 1.4); }
+    }
+    const cands = [];
+    const short = Math.min(w, h);
+    for (const lvl of [0, 2, 4, 7, 10]) {
+      if (lvl > short * 0.08) break;
+      const label = new Int32Array(n).fill(-1);
+      let id = 0;
+      for (let i = 0; i < n; i++) {
+        if (dist[i] <= lvl || label[i] >= 0) continue;
+        const c = { n: 0, sx: 0, sy: 0, sxx: 0, syy: 0, sxy: 0, plate: 0, px: [] };
+        label[i] = id; stack.push(i);
+        while (stack.length) {
+          const k = stack.pop(), x = k % w, y = (k / w) | 0;
+          c.n++; c.sx += x; c.sy += y; c.sxx += x * x; c.syy += y * y; c.sxy += x * y; c.plate += plate[k]; c.px.push(k);
+          const nb = [x > 0 ? k - 1 : -1, x < w - 1 ? k + 1 : -1, y > 0 ? k - w : -1, y < h - 1 ? k + w : -1];
+          for (const m of nb) if (m >= 0 && dist[m] > lvl && label[m] < 0) { label[m] = id; stack.push(m); }
+        }
+        const e = ellipseOf(c, id, label, lvl);
+        if (e) cands.push(e);
+        id++;
+      }
+    }
+    function ellipseOf(c, id, label, lvl) {
+      if (c.n < n * 0.02) return null;            // 太小
+      if (c.plate < c.n * 0.25) return null;      // 幾乎都是洞，不像盤子
+      if (c.plate > c.n * 0.93) return null;      // 裡面沒有東西（天空、牆、空白紙）
+      const mx = c.sx / c.n, my = c.sy / c.n;
+      const vxx = c.sxx / c.n - mx * mx, vyy = c.syy / c.n - my * my, vxy = c.sxy / c.n - mx * my;
+      // 共變異數矩陣的特徵值 → 均勻橢圓的半軸長 = 2√λ
+      const tr = vxx + vyy, det = vxx * vyy - vxy * vxy;
+      const disc = Math.sqrt(Math.max(0, tr * tr / 4 - det));
+      const l1 = tr / 2 + disc, l2 = Math.max(1e-6, tr / 2 - disc);
+      const A0 = 2 * Math.sqrt(l1), B0 = 2 * Math.sqrt(l2);
+      const ang = 0.5 * Math.atan2(2 * vxy, vxx - vyy);
+      const ca = Math.cos(ang), sa = Math.sin(ang);
+      let inter = 0, ell = 0;
+      const x0 = Math.max(0, Math.floor(mx - A0)), x1 = Math.min(w - 1, Math.ceil(mx + A0));
+      const y0 = Math.max(0, Math.floor(my - A0)), y1 = Math.min(h - 1, Math.ceil(my + A0));
+      for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+        const dx = x - mx, dy = y - my;
+        const u = (dx * ca + dy * sa) / A0, v = (-dx * sa + dy * ca) / B0;
+        if (u * u + v * v <= 1) { ell++; if (label[y * w + x] === id) inter++; }
+      }
+      const iou = inter / (c.n + ell - inter);
+      if (iou < 0.75) return null;
+      // 收縮過的區域要把收縮量加回去
+      const A = A0 + lvl, B = B0 + lvl;
+      const ex = Math.sqrt((A * ca) ** 2 + (B * sa) ** 2), ey = Math.sqrt((A * sa) ** 2 + (B * ca) ** 2);
+      let fx = 0, fy = 0, fn = 0, fx0 = w, fx1 = 0, fy0 = h, fy1 = 0;
+      for (const k of c.px) {
+        if (plate[k]) continue;
+        const x = k % w, y = (k / w) | 0;
+        fx += x; fy += y; fn++;
+        if (x < fx0) fx0 = x; if (x > fx1) fx1 = x; if (y < fy0) fy0 = y; if (y > fy1) fy1 = y;
+      }
+      return {
+        cx: mx / w, cy: my / h, rx: ex / w, ry: ey / h, A, B,
+        ratio: B / A, angle: ang * 180 / Math.PI, iou, area: Math.PI * A * B / n, level: lvl,
+        food: fn > c.n * 0.07 ? { cx: fx / fn / w, cy: fy / fn / h, box: { x: fx0 / w, y: fy0 / h, w: (fx1 - fx0 + 1) / w, h: (fy1 - fy0 + 1) / h } } : null,
+        touches: mx - ex < 1 || mx + ex > w - 2 || my - ey < 1 || my + ey > h - 2,
+      };
+    }
+    // 排除：貼著畫面上緣、中心在上方的淺色區域（天空）；過大又不夠像橢圓的（多個盤子和桌面黏在一起）
+    const ok = cands.filter((c) => !(c.cy - c.ry < 0.02 && c.cy < 0.4) && !(c.area > 0.6 && c.iou < 0.88));
+    // 分數：越像橢圓越好（四次方，比大小重要）、裡面有食物加分
+    const score = (c) => Math.sqrt(c.area) * c.iou ** 4 * (c.food ? 1 : 0.5);
+    // 同一個位置在不同收縮程度可能都找到：留下分數最高的那個
+    ok.sort((a, b) => score(b) - score(a));
+    cands.length = 0; cands.push(...ok);
+    const dishes = [];
+    for (const c of cands) {
+      const dup = dishes.some((d) => Math.abs(d.cx - c.cx) < Math.max(d.rx, c.rx) * 0.6 && Math.abs(d.cy - c.cy) < Math.max(d.ry, c.ry) * 0.6);
+      if (!dup) dishes.push(c);
+    }
+    // 食物洞：被盤子色包圍的非盤子區域（盤子邊緣不清楚時，食物仍然會是白色區域裡的洞）
+    const hl = new Int32Array(n).fill(-1), holes = [];
+    for (let i = 0; i < n; i++) {
+      if (!filled[i] || wall[i] || hl[i] >= 0) continue;
+      const c = { n: 0, x0: w, x1: 0, y0: h, y1: 0, sx: 0, sy: 0 };
+      hl[i] = holes.length; stack.push(i);
+      while (stack.length) {
+        const k = stack.pop(), x = k % w, y = (k / w) | 0;
+        c.n++; c.sx += x; c.sy += y;
+        if (x < c.x0) c.x0 = x; if (x > c.x1) c.x1 = x; if (y < c.y0) c.y0 = y; if (y > c.y1) c.y1 = y;
+        const nb = [x > 0 ? k - 1 : -1, x < w - 1 ? k + 1 : -1, y > 0 ? k - w : -1, y < h - 1 ? k + w : -1];
+        for (const m of nb) if (m >= 0 && filled[m] && !wall[m] && hl[m] < 0) { hl[m] = holes.length; stack.push(m); }
+      }
+      holes.push(c);
+    }
+    const big = holes.filter((c) => c.n > n * 0.015).sort((a, b) => b.n - a.n);
+    let foodBlob = null;
+    if (big.length) {
+      const keep = big.filter((c) => c.n >= big[0].n * 0.3);
+      let x0 = w, x1 = 0, y0 = h, y1 = 0, sx = 0, sy = 0, cn = 0;
+      for (const c of keep) { x0 = Math.min(x0, c.x0); x1 = Math.max(x1, c.x1); y0 = Math.min(y0, c.y0); y1 = Math.max(y1, c.y1); sx += c.sx; sy += c.sy; cn += c.n; }
+      foodBlob = { cx: sx / cn / w, cy: sy / cn / h, box: { x: x0 / w, y: y0 / h, w: (x1 - x0 + 1) / w, h: (y1 - y0 + 1) / h }, area: cn / n };
+    }
+    const out = dishes.slice(0, 4);
+    out.foodBlob = foodBlob;
+    return out;
+  }
+
   // ---------- 場景統計（拍攝類型判斷用） ----------
   function sceneStats(d, Lb, mag, w, h) {
     const n = w * h;
@@ -817,7 +999,7 @@ button { cursor: pointer; }
       noPersonTip: '沒有偵測到正面的臉：點畫面上的人，指定為主體',
     },
     food: {
-      drop: ['horizon', 'reflection', 'diagonal'], bonus: { center: 30, fill: 15, thirds: -5, golden: -5, space: -6 },
+      drop: ['horizon', 'reflection', 'diagonal', 'center', 'thirds', 'golden', 'fill', 'space'], bonus: {},
       faces: false, tip: '美食：平的料理從正上方拍，有高度的食物（漢堡、飲料）從斜 45° 拍；畫面邊緣避開手機、紙巾等雜物。',
     },
     landscape: {
@@ -1035,6 +1217,7 @@ button { cursor: pointer; }
 
     const P = S.kind === 'person' ? S : null;
     if (P) suggestPortrait(P, a, out, emptierRight, symEff, prev);
+    if (!P && opts.type === 'food') suggestFood(S, a, out, emptierRight, prev, opts.tilt);
 
     // 1. 三分法（有人像時改用人像版本）
     if (!P) {
@@ -1221,6 +1404,93 @@ button { cursor: pointer; }
     }
   }
 
+  /*
+   * 拍攝角度（0° = 鏡頭朝正下方的俯拍，90° = 水平拍）：
+   *  - 有手機傾斜感測器的值就用它（最準）
+   *  - 否則用盤子橢圓的扁度估計：圓盤看起來的短軸／長軸 ≈ cos(角度)
+   */
+  function cameraAngle(a, tilt) {
+    if (tilt != null && isFinite(tilt)) return { deg: tilt, source: 'sensor' };
+    const d = a.subject.dish;
+    if (d) return { deg: Math.acos(clamp(d.ratio, 0, 1)) * 180 / Math.PI, source: 'dish' };
+    return null;
+  }
+
+  /*
+   * 畫面邊緣的雜物：四邊各取 8% 寬的帶狀區域，排除主體範圍，看顯著性高不高。
+   * 門檻依 27 張美食照片調整。
+   */
+  function edgeClutter(a, keepBox) {
+    const w = a.width, h = a.height, S = a.saliency;
+    const band = 0.08, sides = { 上: [0, 0], 下: [0, 0], 左: [0, 0], 右: [0, 0] };
+    const kb = keepBox;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const u = x / w, v = y / h;
+      if (kb && u >= kb.x && u <= kb.x + kb.w && v >= kb.y && v <= kb.y + kb.h) continue;
+      const val = S[y * w + x];
+      if (v < band) { sides.上[0] += val; sides.上[1]++; }
+      if (v > 1 - band) { sides.下[0] += val; sides.下[1]++; }
+      if (u < band) { sides.左[0] += val; sides.左[1]++; }
+      if (u > 1 - band) { sides.右[0] += val; sides.右[1]++; }
+    }
+    const out = {};
+    for (const k in sides) out[k] = sides[k][1] ? sides[k][0] / sides[k][1] : 0;
+    return out;
+  }
+  const CLUTTER_THR = 0.28;
+
+  function suggestFood(S, a, out, emptierRight, prev, tilt) {
+    const span = Math.max(S.box.w, S.box.h);
+    const ang = cameraAngle(a, tilt);
+    const angTxt = ang ? `目前約 ${Math.round(ang.deg / 5) * 5}°${ang.source === 'dish' ? '（依盤子形狀估計）' : ''}` : '';
+    const dish = S.dish;
+    const foodBox = dish && dish.food ? dish.food.box : S.box;
+    // 共通提示：邊緣雜物
+    const tips = [];
+    const cl = edgeClutter(a, S.box);
+    const messy = Object.keys(cl).filter((k) => cl[k] > CLUTTER_THR);
+    if (messy.length) tips.push(`畫面${messy.join('、')}側邊緣有搶眼的東西（餐具、紙巾、手機？），可以移開，或讓畫面避開`);
+    const topDownHint = ang && ang.deg > 25 ? [`手機抬高、鏡頭朝正下方（${angTxt}）`] : [];
+
+    // 1. 俯拍置中
+    out.push(make('f-top', '俯拍置中', 76 + (ang && ang.deg < 20 ? 8 : 0), { x: 0.5, y: 0.5 }, a, {
+      reason: '從正上方拍，盤子放在正中央、佔畫面約八成。最適合平的料理（麵、飯、披薩）和一桌多盤菜。',
+      guide: 'center', tips: tips.slice(), span: { min: 0.6, max: 0.95 }, extra: topDownHint,
+    }));
+
+    // 2. 俯拍留白：盤子放三分點，另一側留白
+    {
+      const pts = [{ x: 1 / 3, y: 1 / 3 }, { x: 2 / 3, y: 1 / 3 }, { x: 1 / 3, y: 2 / 3 }, { x: 2 / 3, y: 2 / 3 }];
+      const cost = (p) => dist({ x: S.cx, y: S.cy }, p) + ((p.x < 0.5) !== emptierRight ? 0.1 : 0);
+      let best = pts.reduce((m, p) => (cost(p) < cost(m) ? p : m), pts[0]);
+      best = sticky(prev, 'f-flatlay', best, pts, cost);
+      out.push(make('f-flatlay', '俯拍留白', 70 + (ang && ang.deg < 20 ? 6 : 0), best, a, {
+        reason: `從正上方拍，盤子放在${SIDE(best)}的三分點，${best.x < 0.5 ? '右' : '左'}側留白，可以放筷子、飲料或配菜，畫面更有生活感。`,
+        guide: 'thirds', tips: tips.slice(), span: { min: 0.4, max: 0.7 }, extra: topDownHint,
+      }));
+    }
+
+    // 3. 斜拍主角（約 45°）
+    {
+      const extra = [];
+      if (ang && ang.deg < 25) extra.push(`手機往後傾，改成斜約 45° 拍（${angTxt}）`);
+      else if (ang && ang.deg > 70) extra.push(`手機稍微往下，斜約 45° 最好（${angTxt}）`);
+      const good = ang && ang.deg >= 30 && ang.deg <= 60;
+      out.push(make('f-angle', '斜拍主角', 72 + (good ? 8 : 0), { x: 0.5, y: 0.58 }, a, {
+        reason: '從斜 45° 拍，食物放在畫面中下方、佔滿寬度，能拍出高度和層次。適合漢堡、飲料、甜點這類有高度的食物。',
+        guide: 'thirds', tips: tips.slice(), span: { min: 0.7, max: 1 }, extra,
+      }));
+    }
+
+    // 4. 填滿畫面：靠近到盤緣被切掉，讓食物本身成為畫面
+    out.push(make('f-fill', '填滿畫面', 64, { x: 0.5, y: 0.5 }, a, {
+      reason: '再靠近一點，讓食物塞滿畫面，盤緣切掉也沒關係。食物的質感、醬汁和熱氣會更明顯。',
+      guide: 'fill', tips: tips.slice(), span: { min: 1.05, max: 9 },
+      // 裁切到食物本身的範圍（稍微留一點），盤緣切掉
+      scale: clamp(Math.max(foodBox.w, foodBox.h) * 1.05, 0.3, 1), minScale: 0.3, keep: foodBox, noKeepInside: true,
+    }));
+  }
+
   function make(id, name, score, target, a, o) {
     const S = a.subject;
     const C = { x: S.cx, y: S.cy };
@@ -1231,27 +1501,36 @@ button { cursor: pointer; }
       const sure = S.kind === 'person' || S.kind === 'locked' || S.conf >= 0.5;
       fit = bestCrop(a, { x: 0.5, y: o.anchor.y }, { x: 0.5, y: target.y }, null, { minScale: sure ? 0.6 : 0.8, keep: sure ? S.box : null });
     } else {
-      if (S.kind !== 'person' && id !== 'center' && id !== 'fill') target = sizeAware(target, S);
-      target = keepInside(target, C, S.box);
+      if (S.kind !== 'person' && id !== 'center' && id !== 'fill' && !id.startsWith('f-')) target = sizeAware(target, S);
+      if (!o.noKeepInside) target = keepInside(target, C, S.box);
       const sure = S.kind === 'person' || S.kind === 'locked' || S.conf >= 0.5;
       const minScale = sure ? o.minScale : Math.max(o.minScale || 0.5, 0.85);
       // 人像（特寫除外）要保住估計的全身，避免切在腿或腳
-      const keep = S.kind === 'person' && id !== 'p-headshot' && S.faceSize < 0.13 ? S.bodyBox : S.box;
+      const keep = o.keep || (S.kind === 'person' && id !== 'p-headshot' && S.faceSize < 0.13 ? S.bodyBox : S.box);
       fit = bestCrop(a, C, target, S.box, { scale: sure ? o.scale : undefined, minScale, keep });
     }
     // 拍攝時的移動提示：主體要從 C 移到 target（整個畫面座標）
     const aimFrom = o.anchor || C;
     const aimTo = o.anchor ? { x: o.anchor.x, y: target.y } : target;
+    // 額外的拍攝提示（主體大小、拍攝角度）：沒做到就不算「到位」
+    const extra = (o.extra || []).slice();
+    extra.sized = !!o.span;
+    if (o.span) {
+      const span = Math.max(S.box.w, S.box.h);
+      if (span < o.span.min) extra.push('靠近一點');
+      else if (span > o.span.max) extra.push('退後一點');
+    }
     return {
       id, name, score, target, pick,
       reason: o.reason,
       tips: o.tips || [],
       guide: o.guide,
       size: o.size || null,
+      extra,
       crop: fit.crop,
       cropPos: fit.pos,
       cropResidual: fit.residual,
-      aim: aimHint(aimFrom, aimTo, S, o.size),
+      aim: aimHint(aimFrom, aimTo, S, o.size, extra),
     };
   }
 
@@ -1260,7 +1539,7 @@ button { cursor: pointer; }
    * 手機往右移時，畫面中的東西會往左跑，所以「主體要往左」＝「手機往右」。
    * dx、dy 是主體在畫面中需要移動的量；sizeText 是遠近提示。
    */
-  function aimHint(from, to, S, size) {
+  function aimHint(from, to, S, size, extra) {
     const dx = to.x - from.x, dy = to.y - from.y;
     const d = Math.hypot(dx, dy);
     const parts = [];
@@ -1270,12 +1549,14 @@ button { cursor: pointer; }
     const nDir = parts.length;
     if (size === 'large' && S && (S.kind === 'person' ? S.faceSize < 0.2 : S.area < 0.12)) parts.push('靠近一點');
     if (size === 'small' && S && S.area > 0.12) parts.push('退後一點');
-    if (!size && S && S.kind !== 'person' && S.area > 0.55) parts.push('退後一點');
+    // 有自己大小規則的構圖（extra 已處理靠近／退後）不套用一般的「主體太大就退後」
+    if (!size && !(extra && extra.sized) && S && S.kind !== 'person' && S.area > 0.55) parts.push('退後一點');
     if (S && S.kind === 'person' && (S.headTop < 0.01 || S.chin > 0.99)) parts.push('退後一點');
+    for (const e of extra || []) if (!parts.includes(e)) parts.push(e);
     return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, classifyFeatures, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
+  const api = { analyze, suggest, findDishes, edgeClutter, fitCrop, bestCrop, aimHint, classifyScene, classifyFeatures, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -1911,12 +2192,13 @@ button { cursor: pointer; }
     const lockedFace = state.lock && state.lock.type === 'face';
     if (state.sceneMode !== 'auto' && !E.PROFILES[state.sceneMode].faces && !lockedFace) faces = [];
     opts.faces = faces;
+    opts.food = state.sceneMode === 'food';
     state.lastGray = data;
     let a = E.analyze(data, opts);
     // 拍攝類型：手動選的直接用；自動模式依判斷結果（有把握才套用）
     const type = resolveScene(a, isStill);
-    if (state.sceneMode === 'auto' && !E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) {
-      a = E.analyze(data, Object.assign({}, opts, { faces: [] }));
+    if (state.sceneMode === 'auto' && ((!E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) || (type === 'food' && !opts.food))) {
+      a = E.analyze(data, Object.assign({}, opts, { faces: lockedFace ? opts.faces : (E.PROFILES[type].faces ? opts.faces : []), food: type === 'food' }));
     }
     // 自動偵測的主體突然跳到很遠的地方：要連續出現約 1 秒才採用，否則沿用原本的主體
     if (!isStill && state.smooth && !a.subject.kind && !state.smooth.subject.kind) {
@@ -1942,7 +2224,7 @@ button { cursor: pointer; }
     }
     state.smooth = a;
     state.analysis = a;
-    const comps = E.suggest(a, { prev: state.prevTargets, type });
+    const comps = E.suggest(a, { prev: state.prevTargets, type, tilt: state.source === 'live' ? currentTilt() : null });
     for (const c of comps) state.prevTargets[c.id] = c.pick;
     const now = performance.now();
     // 選中的構圖暫時從清單消失時（分數邊界），2.5 秒內沿用它，不要自動換掉
@@ -1965,7 +2247,7 @@ button { cursor: pointer; }
       const hz = cur.guide === 'horizon' || cur.guide === 'reflection';
       const from = hz ? { x: 0.5, y: a.horizon.y } : { x: S.cx, y: S.cy };
       const to = hz ? { x: 0.5, y: cur.horizonTarget } : (cur.guide === 'fill' ? { x: 0.5, y: 0.5 } : cur.target);
-      cur.aim = E.aimHint(from, to, S, cur.size);
+      cur.aim = E.aimHint(from, to, S, cur.size, cur.extra);
       if (comps.includes(cur)) state.selSnap = { id: cur.id, comp: cur, at: now };
     }
     state.comps = comps;
@@ -1973,6 +2255,14 @@ button { cursor: pointer; }
     const ids = comps.slice(0, 5).map((c) => c.id).join(',');
     if (isStill || (ids !== state.chipIds && now - state.lastChipRender > 3000) || !state.lastChipRender) {
       renderChips(); state.lastChipRender = now; state.chipIds = ids;
+    } else {
+      // 不重排，只更新分數
+      for (const b of els.chips.children) {
+        const c = comps.find((x) => x.id === b.dataset.id);
+        if (!c) continue;
+        b.querySelector('.sc').textContent = c.score;
+        b.querySelector('.bar i').style.width = c.score + '%';
+      }
     }
     renderDetail();
     renderReadout();
@@ -2136,7 +2426,29 @@ button { cursor: pointer; }
     els.typeTip.textContent = tip;
   }
 
+  /*
+   * 手機傾斜：鏡頭和「正下方」的夾角。手機平放、鏡頭朝下 = 0°（俯拍）；直立拿著 = 90°。
+   * 由 deviceorientation 的 beta、gamma 算出：cos(夾角) = cos(beta)·cos(gamma)。
+   * iPhone 需要使用者同意（在點選「美食」時詢問）；沒有資料時回傳 null，改用盤子形狀估計。
+   */
+  const tiltState = { deg: null, at: 0, asked: false };
+  window.addEventListener('deviceorientation', (e) => {
+    if (e.beta == null || e.gamma == null) return;
+    const r = Math.PI / 180;
+    const deg = Math.acos(Math.max(-1, Math.min(1, Math.cos(e.beta * r) * Math.cos(e.gamma * r)))) / r;
+    tiltState.deg = tiltState.deg == null ? deg : tiltState.deg * 0.7 + deg * 0.3;
+    tiltState.at = performance.now();
+  });
+  function currentTilt() { return performance.now() - tiltState.at < 1000 ? tiltState.deg : null; }
+  function askTiltPermission() {
+    if (tiltState.asked) return;
+    tiltState.asked = true;
+    const D = window.DeviceOrientationEvent;
+    if (D && typeof D.requestPermission === 'function') D.requestPermission().catch(() => { /* 使用者拒絕：改用盤子形狀估計 */ });
+  }
+
   function setSceneMode(m) {
+    if (m === 'food') askTiltPermission(); // 這裡是使用者點擊，iPhone 才允許詢問
     state.sceneMode = m;
     try { localStorage.setItem('photorium.sceneMode', m); } catch (e) { /* 無法儲存時忽略 */ }
     state.scene.ema = null; state.scene.guess = null; state.scene.candCount = 0;
@@ -2159,7 +2471,10 @@ button { cursor: pointer; }
     const sc = state.scene;
     const kind = sc.type !== 'general' ? E.SCENE_TYPES[sc.type] : '未分類';
     const guess = state.sceneMode === 'auto' && sc.guess ? `（猜 ${E.SCENE_TYPES[sc.guess]} ${(sc.conf * 100).toFixed(0)}%）` : '';
-    els.readout.textContent = `${kind}${guess} · ${who} · 水平線 ${hz}`;
+    const tilt = state.source === 'live' ? currentTilt() : null;
+    const angle = tilt != null ? ` · 角度 ${Math.round(tilt)}°` : (s.dish ? ` · 盤子角度約 ${Math.round(Math.acos(Math.min(1, s.dish.ratio)) * 180 / Math.PI)}°` : '');
+    const who2 = s.kind === 'dish' ? '盤子' : s.kind === 'food' ? '食物' : who;
+    els.readout.textContent = `${kind}${guess} · ${who2}${angle} · 水平線 ${hz}`;
   }
 
   function renderChips() {
@@ -2254,7 +2569,7 @@ button { cursor: pointer; }
       return;
     }
     const D = state.disp;
-    const dt = Math.min(0.1, (now - D.t) / 1000); D.t = now;
+    const dt = Math.min(0.04, (now - D.t) / 1000); D.t = now; // 卡頓的那一格也只走一小步
     const k = 1 - Math.exp(-dt / 0.15);
     const ease = (p, q) => { p.x += (q.x - p.x) * k; p.y += (q.y - p.y) * k; };
     ease(D.from, from); ease(D.to, to);
@@ -2347,7 +2662,8 @@ button { cursor: pointer; }
       ok = c.cropResidual < 0.04;
     } else {
       ok = state.okLatched;
-      const move = phoneDir(c) || c.aim.sizeText || '';
+      const angleHint = (c.extra || []).find((t) => /°/.test(t));
+      const move = angleHint || phoneDir(c) || c.aim.sizeText || '';
       if (state.source === 'still') text = ok ? '構圖到位' : `拍攝時：${move.replace(/^[→←↑↓] /, '') || '微調位置'}`;
       else if (ok) text = '構圖到位，可以拍了';
       else if (performance.now() - state.lostAt < 2500) text = '主體跟丟了，請再點一次';
