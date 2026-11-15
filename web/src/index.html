@@ -25,6 +25,14 @@
 
   <section class="sheet" aria-label="構圖建議">
     <div class="notice" id="notice" hidden></div>
+    <div class="types" id="types" role="radiogroup" aria-label="拍攝類型">
+      <button type="button" class="type" data-type="auto" role="radio">自動</button>
+      <button type="button" class="type" data-type="portrait" role="radio">人像</button>
+      <button type="button" class="type" data-type="food" role="radio">美食</button>
+      <button type="button" class="type" data-type="landscape" role="radio">風景</button>
+      <button type="button" class="type" data-type="perspective" role="radio">延伸</button>
+      <button type="button" class="type" data-type="object" role="radio">物品</button>
+    </div>
     <div class="modes" role="tablist" aria-label="檢視方式">
       <button type="button" role="tab" id="modeAim" class="mode on" aria-selected="true">取景提示</button>
       <button type="button" role="tab" id="modeCrop" class="mode" aria-selected="false">裁切預覽</button>
@@ -34,6 +42,7 @@
       <h2 class="detail-title" id="detailTitle"></h2>
       <p class="reason" id="reason"></p>
       <ul class="tips" id="tips"></ul>
+      <p class="type-tip" id="typeTip"></p>
       <p class="howto" id="howto">點取景畫面上的東西，可以指定要拍的主體。</p>
     </div>
     <div class="controls">
@@ -77,6 +86,9 @@
 </script>
 <script>
 /*__FACE__*/
+</script>
+<script>
+/*__SCENE__*/
 </script>
 <script>
 /*__APP__*/

@@ -6,6 +6,7 @@ let html = src('index.html')
   .replace('/*__ENGINE__*/', () => src('engine.js'))
   .replace('/*__FACE__*/', () => src('face.js').replace('/*__FACEFINDER_B64__*/', () =>
     fs.readFileSync(path.join(__dirname, 'web/vendor/facefinder')).toString('base64')))
+  .replace('/*__SCENE__*/', () => src('scene-model.js'))
   .replace('/*__APP__*/', () => src('app.js'));
 fs.mkdirSync(path.join(__dirname, 'web/dist'), { recursive: true });
 fs.writeFileSync(path.join(__dirname, 'web/dist/photorium.html'), html);

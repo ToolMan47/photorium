@@ -12,7 +12,7 @@
     result: $('result'), resultImg: $('resultImg'), resultMeta: $('resultMeta'), resultTitle: $('resultTitle'),
     showCrop: $('showCrop'), showOrig: $('showOrig'), saveCrop: $('saveCrop'), saveOrig: $('saveOrig'),
     closeResult: $('closeResult'), toast: $('toast'), video: $('video'),
-    lockTag: $('lockTag'), howto: $('howto'),
+    lockTag: $('lockTag'), howto: $('howto'), types: $('types'), typeTip: $('typeTip'),
   };
   const ctx = els.view.getContext('2d');
   const work = document.createElement('canvas');
@@ -43,6 +43,8 @@
     disp: null,            // 畫面上實際繪製的位置（逐格平滑）
     dir: { axis: null },   // 目前提示的方向（加遲滯，避免左右來回）
     chipIds: '',
+    sceneMode: 'auto',     // 使用者選的拍攝類型：auto / portrait / food / landscape / perspective / object
+    scene: { type: 'general', guess: null, conf: 0, ema: null, cand: null, candCount: 0 },
   };
 
   // ---------- 示範場景（程式繪製，不需外部圖片） ----------
@@ -285,9 +287,17 @@
       if (!isStill) trackPatch(L, data);
       if (state.lock) opts.subject = { cx: L.cx, cy: L.cy, box: { x: L.cx - L.bw / 2, y: L.cy - L.bh / 2, w: L.bw, h: L.bh } };
     }
+    // 美食、延伸、物品模式：背景裡的人不當主體（除非使用者點選了那個人）
+    const lockedFace = state.lock && state.lock.type === 'face';
+    if (state.sceneMode !== 'auto' && !E.PROFILES[state.sceneMode].faces && !lockedFace) faces = [];
     opts.faces = faces;
     state.lastGray = data;
-    const a = E.analyze(data, opts);
+    let a = E.analyze(data, opts);
+    // 拍攝類型：手動選的直接用；自動模式依判斷結果（有把握才套用）
+    const type = resolveScene(a, isStill);
+    if (state.sceneMode === 'auto' && !E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) {
+      a = E.analyze(data, Object.assign({}, opts, { faces: [] }));
+    }
     // 自動偵測的主體突然跳到很遠的地方：要連續出現約 1 秒才採用，否則沿用原本的主體
     if (!isStill && state.smooth && !a.subject.kind && !state.smooth.subject.kind) {
       const ps = state.smooth.subject;
@@ -312,7 +322,7 @@
     }
     state.smooth = a;
     state.analysis = a;
-    const comps = E.suggest(a, { prev: state.prevTargets });
+    const comps = E.suggest(a, { prev: state.prevTargets, type });
     for (const c of comps) state.prevTargets[c.id] = c.pick;
     const now = performance.now();
     // 選中的構圖暫時從清單消失時（分數邊界），2.5 秒內沿用它，不要自動換掉
@@ -452,13 +462,82 @@
 
   function selected() { return state.comps.find((c) => c.id === state.selectedId) || state.comps[0]; }
 
+  /*
+   * 自動判斷拍攝類型：
+   *  - 照片：判斷一次
+   *  - 即時：機率做平滑；新類型要連續領先約 1.5 秒才切換，避免一直跳
+   *  - 信心度低於 0.7 時不套用（用一般邏輯），並提示使用者直接選類型
+   *    （依 40 張實拍照片，信心度 ≥ 0.7 的判斷約 67% 正確；見 tools/testset.js eval）
+   */
+  const AUTO_MIN_CONF = 0.7;
+  function resolveScene(a, isStill) {
+    const sc = state.scene;
+    if (state.sceneMode !== 'auto') { setSceneType(state.sceneMode); sc.guess = null; return sc.type; }
+    const r = E.classifyScene(a, window.PhotoriumSceneModel);
+    if (isStill || !sc.ema) sc.ema = Object.assign({}, r.probs);
+    else for (const k of Object.keys(E.SCENE_TYPES)) sc.ema[k] = (sc.ema[k] || 0) * 0.75 + (r.probs[k] || 0) * 0.25;
+    let best = null;
+    for (const k in sc.ema) if (!best || sc.ema[k] > sc.ema[best]) best = k;
+    const conf = best ? sc.ema[best] : 0;
+    if (isStill) { sc.guess = best; sc.conf = conf; }
+    else if (best === sc.guess) { sc.conf = conf; sc.candCount = 0; }
+    else {
+      sc.candCount = sc.cand === best ? sc.candCount + 1 : 1;
+      sc.cand = best;
+      if (!sc.guess || sc.candCount >= 7) { sc.guess = best; sc.conf = conf; sc.candCount = 0; }
+    }
+    setSceneType(sc.guess && sc.conf >= AUTO_MIN_CONF ? sc.guess : 'general');
+    return sc.type;
+  }
+  function setSceneType(t) {
+    const sc = state.scene;
+    if (sc.type === t) return;
+    sc.type = t;
+    // 換類型 → 構圖組合不同，目標重新選
+    state.frozen = null; state.prevTargets = {}; state.lastChipRender = 0; state.okLatched = false;
+    renderTypes();
+  }
+
+  function renderTypes() {
+    const sc = state.scene;
+    for (const b of els.types.children) {
+      const t = b.dataset.type;
+      b.setAttribute('aria-checked', t === state.sceneMode ? 'true' : 'false');
+      if (t === 'auto') {
+        b.textContent = state.sceneMode !== 'auto' ? '自動'
+          : sc.type !== 'general' ? `自動・${E.SCENE_TYPES[sc.type]}` : '自動・未確定';
+      }
+    }
+    const pf = E.PROFILES[sc.type];
+    let tip = pf ? pf.tip : '';
+    if (state.sceneMode === 'auto' && sc.type === 'general') tip = '自動判斷還沒有把握，可以直接選拍攝類型，建議會更準。';
+    els.typeTip.textContent = tip;
+  }
+
+  function setSceneMode(m) {
+    state.sceneMode = m;
+    try { localStorage.setItem('photorium.sceneMode', m); } catch (e) { /* 無法儲存時忽略 */ }
+    state.scene.ema = null; state.scene.guess = null; state.scene.candCount = 0;
+    state.scene.type = null; // 強制重設
+    setSceneType(m === 'auto' ? 'general' : m);
+    renderTypes();
+    if (state.lastGray) analyzeNow(state.source === 'still');
+  }
+  els.types.addEventListener('click', (e) => {
+    const b = e.target.closest('.type');
+    if (b) setSceneMode(b.dataset.type);
+  });
+
   function renderReadout() {
     const a = state.analysis;
     if (!a) return;
     const s = a.subject;
     const hz = a.horizon.valid ? `${a.horizon.angle > 0 ? '+' : ''}${a.horizon.angle.toFixed(1)}°` : '—';
     const who = s.kind === 'person' ? `人臉 ${s.count} · 臉寬 ${(s.faceSize * 100).toFixed(0)}%` : `主體 ${(s.area * 100).toFixed(0)}% · 信心 ${(s.conf * 100).toFixed(0)}`;
-    els.readout.textContent = `${who} · 水平線 ${hz} · 對稱 ${(a.symLR * 100).toFixed(0)}`;
+    const sc = state.scene;
+    const kind = sc.type !== 'general' ? E.SCENE_TYPES[sc.type] : '未分類';
+    const guess = state.sceneMode === 'auto' && sc.guess ? `（猜 ${E.SCENE_TYPES[sc.guess]} ${(sc.conf * 100).toFixed(0)}%）` : '';
+    els.readout.textContent = `${kind}${guess} · ${who} · 水平線 ${hz}`;
   }
 
   function renderChips() {
@@ -861,6 +940,9 @@
 
   // ---------- 啟動 ----------
   async function boot() {
+    try { const m = localStorage.getItem('photorium.sceneMode'); if (m && (m === 'auto' || E.SCENE_TYPES[m])) state.sceneMode = m; } catch (e) { /* 忽略 */ }
+    state.scene.type = state.sceneMode === 'auto' ? 'general' : state.sceneMode;
+    renderTypes();
     loadScene(0);
     requestAnimationFrame(frame);
     const ok = await startCamera();

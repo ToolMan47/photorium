@@ -105,6 +105,15 @@ button { cursor: pointer; }
   font-size: 13px; line-height: 1.55; color: var(--fg); background: var(--panel-2);
   border: 1px solid var(--line); border-left: 3px solid var(--warn); padding: 8px 10px; border-radius: 4px;
 }
+.types { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding-bottom: 1px; }
+.types::-webkit-scrollbar { display: none; }
+.type {
+  flex: none; background: none; border: 1px solid var(--line); border-radius: 999px; padding: 5px 13px;
+  font-size: 13.5px; color: var(--muted); white-space: nowrap;
+}
+.type[aria-checked="true"] { background: var(--focus); color: #1d1606; border-color: transparent; font-weight: 700; }
+.type-tip { margin: 6px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--fg); opacity: 0.85; }
+.type-tip:empty { display: none; }
 .modes { display: flex; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 3px; }
 .mode {
   flex: 1; background: none; border: 0; border-radius: 6px; padding: 7px 0; font-size: 14px; color: var(--muted);

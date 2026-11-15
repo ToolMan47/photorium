@@ -135,13 +135,14 @@
     }
     const Sal = normalize(boxBlur(S, w, h, 2));
     const person = opts.faces && opts.faces.length ? buildPerson(opts.faces) : null;
+    const salSubject = findSubject(Sal, w, h);
     let subject;
     if (person) subject = person;
     else if (opts.subject) {
       // 使用者點選並追蹤中的主體
       const b = opts.subject.box;
       subject = { kind: 'locked', cx: opts.subject.cx, cy: opts.subject.cy, box: b, area: b.w * b.h, conf: 1 };
-    } else subject = findSubject(Sal, w, h);
+    } else subject = salSubject;
     const sym = symmetry(Lb, w, h, mL.std);
     const lines = lineOrientation(gx, gy, mag, w, h);
 
@@ -174,6 +175,9 @@
       sideWeight: { left: leftMass / leftArea, right: rightMass / rightArea, top: topMass, bottom: bottomMass },
       brightness: mL.mean / 255,
       contrast: mL.std / 128,
+      salSubject,
+      stats: sceneStats(d, Lb, mag, w, h),
+      vanish: vanishingPoint(gx, gy, mag, w, h),
     };
   }
 
@@ -369,6 +373,189 @@
       diagDir: d1 > d2 ? '\\' : '/',
       diagDominance: Math.max(d1, d2) / ((d1 + d2) || 1),
     };
+  }
+
+  // ---------- 場景統計（拍攝類型判斷用） ----------
+  function sceneStats(d, Lb, mag, w, h) {
+    const n = w * h;
+    let mSum = 0;
+    for (let i = 0; i < n; i++) mSum += mag[i];
+    const mMean = mSum / n || 1;
+    // 上方 30%：平滑（天空、天花板）的比例
+    const topRows = Math.round(h * 0.3);
+    let smooth = 0, edges = 0, warm = 0, cN = 0, satSum = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x, j = i * 4;
+        if (y < topRows && mag[i] < mMean * 0.5) smooth++;
+        if (mag[i] > mMean * 1.5) edges++;
+        const r = d[j], g = d[j + 1], b = d[j + 2];
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        const sat = mx ? (mx - mn) / mx : 0;
+        satSum += sat;
+        // 畫面中央 60%：暖色（橘、褐、黃）的比例，食物常見的色調
+        if (x > w * 0.2 && x < w * 0.8 && y > h * 0.2 && y < h * 0.8) {
+          cN++;
+          if (r >= g && g >= b && sat > 0.25 && mx > 60) warm++;
+        }
+      }
+    }
+    return {
+      topSmooth: smooth / (topRows * w || 1),
+      edgeDensity: edges / n,
+      warmCenter: cN ? warm / cN : 0,
+      saturation: satSum / n,
+    };
+  }
+
+  /*
+   * 消失點：每個強邊緣像素沿著自己的線條方向，替線條經過的位置投票；
+   * 很多線條交會在同一點 → 有收斂感（道路、走廊、街道、建築透視）。
+   * 接近水平或垂直的線（正面看的建築、地平線）不投票，它們在畫面中是平行的。
+   * 候選點範圍包含畫面外一點（-25%～125%），消失點常落在畫面邊緣外。
+   */
+  function vanishingPoint(gx, gy, mag, w, h) {
+    const st = meanStd(mag);
+    const thr = st.mean + 1.5 * st.std;
+    const G = 24, lo = -0.25, span = 1.5;
+    const acc = new Float32Array(G * G);
+    let total = 0;
+    for (let y = 2; y < h - 2; y++) {
+      for (let x = 2; x < w - 2; x++) {
+        const i = y * w + x, m = mag[i];
+        if (m < thr) continue;
+        // 線的方向 = 梯度轉 90°
+        let dx = -gy[i], dy = gx[i];
+        const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+        if (Math.abs(dx) < 0.2 || Math.abs(dy) < 0.2) continue; // 太接近垂直或水平
+        const px = x / w, py = y / h;
+        total += m;
+        for (let c = 0; c < G; c++) {
+          const cx = lo + (c + 0.5) / G * span;
+          // 只投給離自己夠遠的位置：否則邊緣多的地方會因為「線經過自己」而得到假的高分
+          if (Math.abs(cx - px) < 0.2) continue;
+          const t = (cx - px) / dx;
+          const cy = py + t * dy * (w / h); // 換算成正規化的 y
+          const r = Math.floor((cy - lo) / span * G);
+          if (r >= 0 && r < G) acc[r * G + c] += m;
+        }
+      }
+    }
+    if (!total) return { x: 0.5, y: 0.5, score: 0 };
+    // 3×3 平滑後找最高點；分數 = 最高點比平均高幾倍（沒有收斂時投票會均勻散開）
+    let accSum = 0;
+    for (let i = 0; i < acc.length; i++) accSum += acc[i];
+    const avg3 = accSum / acc.length * 9 || 1;
+    let best = -1, bi = 0;
+    for (let r = 1; r < G - 1; r++) for (let c = 1; c < G - 1; c++) {
+      let v = 0;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) v += acc[(r + a) * G + c + b];
+      if (v > best) { best = v; bi = r * G + c; }
+    }
+    const r = Math.floor(bi / G), c = bi % G;
+    return { x: lo + (c + 0.5) / G * span, y: lo + (r + 0.5) / G * span, score: best / avg3, edges: total };
+  }
+
+  /*
+   * 拍攝類型的特徵向量（每個值大約落在 0～1）。
+   * 順序必須和 scene-model.js 的 features 一致。
+   */
+  const SCENE_FEATURES = ['horizon', 'linesH', 'linesV', 'linesDiag', 'vanish', 'vanishInside',
+    'symLR', 'emptiness', 'subjectConf', 'subjectArea', 'edgeDensity', 'warmCenter', 'brightness', 'contrast'];
+  function sceneFeatures(a) {
+    const L = a.lines, st = a.stats, ss = a.salSubject;
+    const V = a.vanish;
+    const inside = V.x > 0.05 && V.x < 0.95 && V.y > 0.05 && V.y < 0.95 ? 1 : 0;
+    return [
+      a.horizon.valid ? 1 : 0,
+      L.horizontal, L.vertical, L.diagonal,
+      Math.min(1, Math.max(0, (V.score - 1) / 8)), inside * Math.min(1, Math.max(0, (V.score - 1) / 8)),
+      a.symLR, a.emptiness,
+      ss.conf, Math.min(1, ss.area * 3),
+      Math.min(1, st.edgeDensity * 4), st.warmCenter,
+      a.brightness, Math.min(1, a.contrast),
+    ];
+  }
+
+  const SCENE_TYPES = {
+    portrait: '人像', food: '美食', landscape: '風景', perspective: '延伸', object: '物品',
+  };
+
+  /*
+   * 自動判斷拍攝類型：
+   *  - 偵測到夠大的人臉 → 人像（人臉偵測比其他特徵可靠）
+   *  - 其他類型用「最近中心點」：和每種類型的平均特徵比距離（各特徵先除以標準差），越近機率越高
+   * model 由 tools/testset.js fit 從標註照片產生；照片越多越準。
+   */
+  function classifyScene(a, model) {
+    const probs = {};
+    const P = a.person;
+    if (P && P.faceSize >= 0.05) {
+      for (const k of Object.keys(SCENE_TYPES)) probs[k] = k === 'portrait' ? 0.9 : 0.1 / 4;
+      return { type: 'portrait', conf: 0.9, probs };
+    }
+    if (!model || !model.centroids) return { type: 'object', conf: 0, probs: {} };
+    const f = sceneFeatures(a);
+    const sd = model.std;
+    // 只用模型挑選過的特徵（由 tools/testset.js fit 依標註照片選出）
+    const use = (model.use || SCENE_FEATURES).map((n) => SCENE_FEATURES.indexOf(n)).filter((i) => i >= 0);
+    const dist = {};
+    for (const [k, c] of Object.entries(model.centroids)) {
+      let d2 = 0;
+      for (const i of use) { const z = (f[i] - c[i]) / sd[i]; d2 += z * z; }
+      dist[k] = d2 / use.length;
+    }
+    // 距離 → 機率（溫度依資料調整）
+    let sum = 0;
+    for (const k in dist) { probs[k] = Math.exp(-dist[k] / (model.temperature || 1)); sum += probs[k]; }
+    let best = null;
+    for (const k in probs) { probs[k] /= sum; if (!best || probs[k] > probs[best]) best = k; }
+    // 有小人臉（例如風景中的人）時，人像也列為可能
+    if (P) { probs.portrait = 0.3; }
+    return { type: best, conf: probs[best], probs };
+  }
+
+  /*
+   * 各拍攝類型的構圖設定：
+   *   drop：這個類型不適用的構圖
+   *   bonus：加減分（讓適合的構圖排前面）
+   *   faces：是否把人臉當成主體（美食、延伸、物品模式下，背景路人不該變成主體）
+   *   tip：顯示在說明區的一行拍攝要點
+   * 「general」= 不分類型，維持原本的邏輯（自動模式沒有把握時使用）。
+   * 之後的美食模式、延伸模式會在這裡加入各自專用的構圖。
+   */
+  const PROFILES = {
+    general: { drop: [], bonus: {}, faces: true, tip: '' },
+    portrait: {
+      drop: ['diagonal'], bonus: { 'p-thirds': 6, 'p-center': 6, 'p-headshot': 6, 'p-group': 6, space: -8, horizon: -8 },
+      faces: true, tip: '人像：眼睛放在上三分線，頭頂留一點空間，不要切在關節。',
+      noPersonTip: '沒有偵測到正面的臉：點畫面上的人，指定為主體',
+    },
+    food: {
+      drop: ['horizon', 'reflection', 'diagonal'], bonus: { center: 30, fill: 15, thirds: -5, golden: -5, space: -6 },
+      faces: false, tip: '美食：平的料理從正上方拍，有高度的食物（漢堡、飲料）從斜 45° 拍；畫面邊緣避開手機、紙巾等雜物。',
+    },
+    landscape: {
+      drop: ['fill'], bonus: { horizon: 12, reflection: 10, space: 8, golden: 4 },
+      faces: true, tip: '風景：先把水平線拉平，再決定天空和地面各佔多少。',
+    },
+    perspective: {
+      drop: ['fill', 'space'], bonus: { center: 20, diagonal: 22, thirds: -5, horizon: -10 },
+      faces: false, tip: '延伸：讓道路、走廊、建築的線條往遠方收斂，盡頭放在中央或三分點。',
+    },
+    object: {
+      drop: ['horizon', 'reflection'], bonus: { fill: 16, thirds: 2, center: 6 },
+      faces: false, tip: '物品：主體清楚、背景簡單，靠近一點讓細節成為主角。',
+    },
+  };
+
+  function applyProfile(out, type, a) {
+    const pf = PROFILES[type] || PROFILES.general;
+    let list = out.filter((c) => !pf.drop.includes(c.id));
+    if (!list.length) list = out; // 保底：不要讓清單變空
+    for (const c of list) c.score += pf.bonus[c.id] || 0;
+    if (pf.noPersonTip && a.subject.kind !== 'person') for (const c of list) if (!c.tips.includes(pf.noPersonTip)) c.tips.unshift(pf.noPersonTip);
+    return list;
   }
 
   // ---------- 人物 ----------
@@ -692,9 +879,10 @@
         for (const t of tips) if (!c.tips.includes(t)) c.tips.push(t);
       }
     }
-    for (const c of out) c.score = Math.round(clamp(c.score, 5, 98));
-    out.sort((p, q) => q.score - p.score);
-    return out;
+    const list = applyProfile(out, opts.type || 'general', a);
+    for (const c of list) c.score = Math.round(clamp(c.score, 5, 98));
+    list.sort((p, q) => q.score - p.score);
+    return list;
   }
 
   function suggestPortrait(P, a, out, emptierRight, symEff, prev) {
@@ -802,7 +990,7 @@
     return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, PHI };
+  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);

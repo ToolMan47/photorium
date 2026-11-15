@@ -119,6 +119,15 @@ button { cursor: pointer; }
   font-size: 13px; line-height: 1.55; color: var(--fg); background: var(--panel-2);
   border: 1px solid var(--line); border-left: 3px solid var(--warn); padding: 8px 10px; border-radius: 4px;
 }
+.types { display: flex; gap: 6px; overflow-x: auto; scrollbar-width: none; padding-bottom: 1px; }
+.types::-webkit-scrollbar { display: none; }
+.type {
+  flex: none; background: none; border: 1px solid var(--line); border-radius: 999px; padding: 5px 13px;
+  font-size: 13.5px; color: var(--muted); white-space: nowrap;
+}
+.type[aria-checked="true"] { background: var(--focus); color: #1d1606; border-color: transparent; font-weight: 700; }
+.type-tip { margin: 6px 0 0; font-size: 12.5px; line-height: 1.55; color: var(--fg); opacity: 0.85; }
+.type-tip:empty { display: none; }
 .modes { display: flex; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 3px; }
 .mode {
   flex: 1; background: none; border: 0; border-radius: 6px; padding: 7px 0; font-size: 14px; color: var(--muted);
@@ -221,6 +230,14 @@ button { cursor: pointer; }
 
   <section class="sheet" aria-label="構圖建議">
     <div class="notice" id="notice" hidden></div>
+    <div class="types" id="types" role="radiogroup" aria-label="拍攝類型">
+      <button type="button" class="type" data-type="auto" role="radio">自動</button>
+      <button type="button" class="type" data-type="portrait" role="radio">人像</button>
+      <button type="button" class="type" data-type="food" role="radio">美食</button>
+      <button type="button" class="type" data-type="landscape" role="radio">風景</button>
+      <button type="button" class="type" data-type="perspective" role="radio">延伸</button>
+      <button type="button" class="type" data-type="object" role="radio">物品</button>
+    </div>
     <div class="modes" role="tablist" aria-label="檢視方式">
       <button type="button" role="tab" id="modeAim" class="mode on" aria-selected="true">取景提示</button>
       <button type="button" role="tab" id="modeCrop" class="mode" aria-selected="false">裁切預覽</button>
@@ -230,6 +247,7 @@ button { cursor: pointer; }
       <h2 class="detail-title" id="detailTitle"></h2>
       <p class="reason" id="reason"></p>
       <ul class="tips" id="tips"></ul>
+      <p class="type-tip" id="typeTip"></p>
       <p class="howto" id="howto">點取景畫面上的東西，可以指定要拍的主體。</p>
     </div>
     <div class="controls">
@@ -406,13 +424,14 @@ button { cursor: pointer; }
     }
     const Sal = normalize(boxBlur(S, w, h, 2));
     const person = opts.faces && opts.faces.length ? buildPerson(opts.faces) : null;
+    const salSubject = findSubject(Sal, w, h);
     let subject;
     if (person) subject = person;
     else if (opts.subject) {
       // 使用者點選並追蹤中的主體
       const b = opts.subject.box;
       subject = { kind: 'locked', cx: opts.subject.cx, cy: opts.subject.cy, box: b, area: b.w * b.h, conf: 1 };
-    } else subject = findSubject(Sal, w, h);
+    } else subject = salSubject;
     const sym = symmetry(Lb, w, h, mL.std);
     const lines = lineOrientation(gx, gy, mag, w, h);
 
@@ -445,6 +464,9 @@ button { cursor: pointer; }
       sideWeight: { left: leftMass / leftArea, right: rightMass / rightArea, top: topMass, bottom: bottomMass },
       brightness: mL.mean / 255,
       contrast: mL.std / 128,
+      salSubject,
+      stats: sceneStats(d, Lb, mag, w, h),
+      vanish: vanishingPoint(gx, gy, mag, w, h),
     };
   }
 
@@ -640,6 +662,189 @@ button { cursor: pointer; }
       diagDir: d1 > d2 ? '\\' : '/',
       diagDominance: Math.max(d1, d2) / ((d1 + d2) || 1),
     };
+  }
+
+  // ---------- 場景統計（拍攝類型判斷用） ----------
+  function sceneStats(d, Lb, mag, w, h) {
+    const n = w * h;
+    let mSum = 0;
+    for (let i = 0; i < n; i++) mSum += mag[i];
+    const mMean = mSum / n || 1;
+    // 上方 30%：平滑（天空、天花板）的比例
+    const topRows = Math.round(h * 0.3);
+    let smooth = 0, edges = 0, warm = 0, cN = 0, satSum = 0;
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        const i = y * w + x, j = i * 4;
+        if (y < topRows && mag[i] < mMean * 0.5) smooth++;
+        if (mag[i] > mMean * 1.5) edges++;
+        const r = d[j], g = d[j + 1], b = d[j + 2];
+        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
+        const sat = mx ? (mx - mn) / mx : 0;
+        satSum += sat;
+        // 畫面中央 60%：暖色（橘、褐、黃）的比例，食物常見的色調
+        if (x > w * 0.2 && x < w * 0.8 && y > h * 0.2 && y < h * 0.8) {
+          cN++;
+          if (r >= g && g >= b && sat > 0.25 && mx > 60) warm++;
+        }
+      }
+    }
+    return {
+      topSmooth: smooth / (topRows * w || 1),
+      edgeDensity: edges / n,
+      warmCenter: cN ? warm / cN : 0,
+      saturation: satSum / n,
+    };
+  }
+
+  /*
+   * 消失點：每個強邊緣像素沿著自己的線條方向，替線條經過的位置投票；
+   * 很多線條交會在同一點 → 有收斂感（道路、走廊、街道、建築透視）。
+   * 接近水平或垂直的線（正面看的建築、地平線）不投票，它們在畫面中是平行的。
+   * 候選點範圍包含畫面外一點（-25%～125%），消失點常落在畫面邊緣外。
+   */
+  function vanishingPoint(gx, gy, mag, w, h) {
+    const st = meanStd(mag);
+    const thr = st.mean + 1.5 * st.std;
+    const G = 24, lo = -0.25, span = 1.5;
+    const acc = new Float32Array(G * G);
+    let total = 0;
+    for (let y = 2; y < h - 2; y++) {
+      for (let x = 2; x < w - 2; x++) {
+        const i = y * w + x, m = mag[i];
+        if (m < thr) continue;
+        // 線的方向 = 梯度轉 90°
+        let dx = -gy[i], dy = gx[i];
+        const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+        if (Math.abs(dx) < 0.2 || Math.abs(dy) < 0.2) continue; // 太接近垂直或水平
+        const px = x / w, py = y / h;
+        total += m;
+        for (let c = 0; c < G; c++) {
+          const cx = lo + (c + 0.5) / G * span;
+          // 只投給離自己夠遠的位置：否則邊緣多的地方會因為「線經過自己」而得到假的高分
+          if (Math.abs(cx - px) < 0.2) continue;
+          const t = (cx - px) / dx;
+          const cy = py + t * dy * (w / h); // 換算成正規化的 y
+          const r = Math.floor((cy - lo) / span * G);
+          if (r >= 0 && r < G) acc[r * G + c] += m;
+        }
+      }
+    }
+    if (!total) return { x: 0.5, y: 0.5, score: 0 };
+    // 3×3 平滑後找最高點；分數 = 最高點比平均高幾倍（沒有收斂時投票會均勻散開）
+    let accSum = 0;
+    for (let i = 0; i < acc.length; i++) accSum += acc[i];
+    const avg3 = accSum / acc.length * 9 || 1;
+    let best = -1, bi = 0;
+    for (let r = 1; r < G - 1; r++) for (let c = 1; c < G - 1; c++) {
+      let v = 0;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) v += acc[(r + a) * G + c + b];
+      if (v > best) { best = v; bi = r * G + c; }
+    }
+    const r = Math.floor(bi / G), c = bi % G;
+    return { x: lo + (c + 0.5) / G * span, y: lo + (r + 0.5) / G * span, score: best / avg3, edges: total };
+  }
+
+  /*
+   * 拍攝類型的特徵向量（每個值大約落在 0～1）。
+   * 順序必須和 scene-model.js 的 features 一致。
+   */
+  const SCENE_FEATURES = ['horizon', 'linesH', 'linesV', 'linesDiag', 'vanish', 'vanishInside',
+    'symLR', 'emptiness', 'subjectConf', 'subjectArea', 'edgeDensity', 'warmCenter', 'brightness', 'contrast'];
+  function sceneFeatures(a) {
+    const L = a.lines, st = a.stats, ss = a.salSubject;
+    const V = a.vanish;
+    const inside = V.x > 0.05 && V.x < 0.95 && V.y > 0.05 && V.y < 0.95 ? 1 : 0;
+    return [
+      a.horizon.valid ? 1 : 0,
+      L.horizontal, L.vertical, L.diagonal,
+      Math.min(1, Math.max(0, (V.score - 1) / 8)), inside * Math.min(1, Math.max(0, (V.score - 1) / 8)),
+      a.symLR, a.emptiness,
+      ss.conf, Math.min(1, ss.area * 3),
+      Math.min(1, st.edgeDensity * 4), st.warmCenter,
+      a.brightness, Math.min(1, a.contrast),
+    ];
+  }
+
+  const SCENE_TYPES = {
+    portrait: '人像', food: '美食', landscape: '風景', perspective: '延伸', object: '物品',
+  };
+
+  /*
+   * 自動判斷拍攝類型：
+   *  - 偵測到夠大的人臉 → 人像（人臉偵測比其他特徵可靠）
+   *  - 其他類型用「最近中心點」：和每種類型的平均特徵比距離（各特徵先除以標準差），越近機率越高
+   * model 由 tools/testset.js fit 從標註照片產生；照片越多越準。
+   */
+  function classifyScene(a, model) {
+    const probs = {};
+    const P = a.person;
+    if (P && P.faceSize >= 0.05) {
+      for (const k of Object.keys(SCENE_TYPES)) probs[k] = k === 'portrait' ? 0.9 : 0.1 / 4;
+      return { type: 'portrait', conf: 0.9, probs };
+    }
+    if (!model || !model.centroids) return { type: 'object', conf: 0, probs: {} };
+    const f = sceneFeatures(a);
+    const sd = model.std;
+    // 只用模型挑選過的特徵（由 tools/testset.js fit 依標註照片選出）
+    const use = (model.use || SCENE_FEATURES).map((n) => SCENE_FEATURES.indexOf(n)).filter((i) => i >= 0);
+    const dist = {};
+    for (const [k, c] of Object.entries(model.centroids)) {
+      let d2 = 0;
+      for (const i of use) { const z = (f[i] - c[i]) / sd[i]; d2 += z * z; }
+      dist[k] = d2 / use.length;
+    }
+    // 距離 → 機率（溫度依資料調整）
+    let sum = 0;
+    for (const k in dist) { probs[k] = Math.exp(-dist[k] / (model.temperature || 1)); sum += probs[k]; }
+    let best = null;
+    for (const k in probs) { probs[k] /= sum; if (!best || probs[k] > probs[best]) best = k; }
+    // 有小人臉（例如風景中的人）時，人像也列為可能
+    if (P) { probs.portrait = 0.3; }
+    return { type: best, conf: probs[best], probs };
+  }
+
+  /*
+   * 各拍攝類型的構圖設定：
+   *   drop：這個類型不適用的構圖
+   *   bonus：加減分（讓適合的構圖排前面）
+   *   faces：是否把人臉當成主體（美食、延伸、物品模式下，背景路人不該變成主體）
+   *   tip：顯示在說明區的一行拍攝要點
+   * 「general」= 不分類型，維持原本的邏輯（自動模式沒有把握時使用）。
+   * 之後的美食模式、延伸模式會在這裡加入各自專用的構圖。
+   */
+  const PROFILES = {
+    general: { drop: [], bonus: {}, faces: true, tip: '' },
+    portrait: {
+      drop: ['diagonal'], bonus: { 'p-thirds': 6, 'p-center': 6, 'p-headshot': 6, 'p-group': 6, space: -8, horizon: -8 },
+      faces: true, tip: '人像：眼睛放在上三分線，頭頂留一點空間，不要切在關節。',
+      noPersonTip: '沒有偵測到正面的臉：點畫面上的人，指定為主體',
+    },
+    food: {
+      drop: ['horizon', 'reflection', 'diagonal'], bonus: { center: 30, fill: 15, thirds: -5, golden: -5, space: -6 },
+      faces: false, tip: '美食：平的料理從正上方拍，有高度的食物（漢堡、飲料）從斜 45° 拍；畫面邊緣避開手機、紙巾等雜物。',
+    },
+    landscape: {
+      drop: ['fill'], bonus: { horizon: 12, reflection: 10, space: 8, golden: 4 },
+      faces: true, tip: '風景：先把水平線拉平，再決定天空和地面各佔多少。',
+    },
+    perspective: {
+      drop: ['fill', 'space'], bonus: { center: 20, diagonal: 22, thirds: -5, horizon: -10 },
+      faces: false, tip: '延伸：讓道路、走廊、建築的線條往遠方收斂，盡頭放在中央或三分點。',
+    },
+    object: {
+      drop: ['horizon', 'reflection'], bonus: { fill: 16, thirds: 2, center: 6 },
+      faces: false, tip: '物品：主體清楚、背景簡單，靠近一點讓細節成為主角。',
+    },
+  };
+
+  function applyProfile(out, type, a) {
+    const pf = PROFILES[type] || PROFILES.general;
+    let list = out.filter((c) => !pf.drop.includes(c.id));
+    if (!list.length) list = out; // 保底：不要讓清單變空
+    for (const c of list) c.score += pf.bonus[c.id] || 0;
+    if (pf.noPersonTip && a.subject.kind !== 'person') for (const c of list) if (!c.tips.includes(pf.noPersonTip)) c.tips.unshift(pf.noPersonTip);
+    return list;
   }
 
   // ---------- 人物 ----------
@@ -963,9 +1168,10 @@ button { cursor: pointer; }
         for (const t of tips) if (!c.tips.includes(t)) c.tips.push(t);
       }
     }
-    for (const c of out) c.score = Math.round(clamp(c.score, 5, 98));
-    out.sort((p, q) => q.score - p.score);
-    return out;
+    const list = applyProfile(out, opts.type || 'general', a);
+    for (const c of list) c.score = Math.round(clamp(c.score, 5, 98));
+    list.sort((p, q) => q.score - p.score);
+    return list;
   }
 
   function suggestPortrait(P, a, out, emptierRight, symEff, prev) {
@@ -1073,7 +1279,7 @@ button { cursor: pointer; }
     return { dx, dy, dist: d, text: parts.join('、'), sizeText: parts.slice(nDir).join('、'), ok: parts.length === 0 };
   }
 
-  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, PHI };
+  const api = { analyze, suggest, fitCrop, bestCrop, aimHint, classifyScene, sceneFeatures, SCENE_FEATURES, SCENE_TYPES, PROFILES, PHI };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.PhotoriumEngine = api;
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -1289,6 +1495,131 @@ button { cursor: pointer; }
 
 </script>
 <script>
+/* 由 tools/testset.js fit 自動產生，請勿手動編輯。
+ * 標註照片：40 張（美食 2、風景 13、延伸 12、物品 9；人像另由人臉判斷）
+ * 產生時間：2026-11-15T15:36:13.280Z
+ */
+(function (root) {
+  const model = {
+    "features": [
+      "horizon",
+      "linesH",
+      "linesV",
+      "linesDiag",
+      "vanish",
+      "vanishInside",
+      "symLR",
+      "emptiness",
+      "subjectConf",
+      "subjectArea",
+      "edgeDensity",
+      "warmCenter",
+      "brightness",
+      "contrast"
+    ],
+    "use": [
+      "emptiness",
+      "linesDiag",
+      "vanishInside",
+      "subjectConf",
+      "edgeDensity"
+    ],
+    "centroids": {
+      "food": [
+        0,
+        0.2795,
+        0.2468,
+        0.4738,
+        0.1117,
+        0,
+        0.3833,
+        0.2429,
+        0.0304,
+        0.7794,
+        0.9246,
+        0.3002,
+        0.5044,
+        0.5272
+      ],
+      "landscape": [
+        0.3846,
+        0.2881,
+        0.2647,
+        0.4472,
+        0.1429,
+        0.0676,
+        0.544,
+        0.6069,
+        0.2058,
+        0.421,
+        0.8618,
+        0.0768,
+        0.2803,
+        0.3656
+      ],
+      "perspective": [
+        0.1667,
+        0.3462,
+        0.2849,
+        0.3688,
+        0.1938,
+        0.0812,
+        0.4673,
+        0.5284,
+        0.1457,
+        0.5997,
+        0.9174,
+        0.2292,
+        0.3336,
+        0.3902
+      ],
+      "object": [
+        0.2222,
+        0.3811,
+        0.3217,
+        0.2972,
+        0.1981,
+        0.0223,
+        0.4033,
+        0.3691,
+        0.1694,
+        0.8715,
+        0.9249,
+        0.2915,
+        0.4085,
+        0.4219
+      ]
+    },
+    "std": [
+      0.433,
+      0.1304,
+      0.1229,
+      0.0947,
+      0.0852,
+      0.0777,
+      0.1309,
+      0.2003,
+      0.1146,
+      0.329,
+      0.0799,
+      0.2094,
+      0.1168,
+      0.1174
+    ],
+    "counts": {
+      "food": 2,
+      "landscape": 13,
+      "perspective": 12,
+      "object": 9
+    },
+    "temperature": 0.5
+  };
+  if (typeof module !== 'undefined' && module.exports) module.exports = model;
+  else root.PhotoriumSceneModel = model;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
 /* Photorium 構圖相機：相機、即時分析、參考線、預覽與拍照 */
 (function () {
   'use strict';
@@ -1303,7 +1634,7 @@ button { cursor: pointer; }
     result: $('result'), resultImg: $('resultImg'), resultMeta: $('resultMeta'), resultTitle: $('resultTitle'),
     showCrop: $('showCrop'), showOrig: $('showOrig'), saveCrop: $('saveCrop'), saveOrig: $('saveOrig'),
     closeResult: $('closeResult'), toast: $('toast'), video: $('video'),
-    lockTag: $('lockTag'), howto: $('howto'),
+    lockTag: $('lockTag'), howto: $('howto'), types: $('types'), typeTip: $('typeTip'),
   };
   const ctx = els.view.getContext('2d');
   const work = document.createElement('canvas');
@@ -1334,6 +1665,8 @@ button { cursor: pointer; }
     disp: null,            // 畫面上實際繪製的位置（逐格平滑）
     dir: { axis: null },   // 目前提示的方向（加遲滯，避免左右來回）
     chipIds: '',
+    sceneMode: 'auto',     // 使用者選的拍攝類型：auto / portrait / food / landscape / perspective / object
+    scene: { type: 'general', guess: null, conf: 0, ema: null, cand: null, candCount: 0 },
   };
 
   // ---------- 示範場景（程式繪製，不需外部圖片） ----------
@@ -1576,9 +1909,17 @@ button { cursor: pointer; }
       if (!isStill) trackPatch(L, data);
       if (state.lock) opts.subject = { cx: L.cx, cy: L.cy, box: { x: L.cx - L.bw / 2, y: L.cy - L.bh / 2, w: L.bw, h: L.bh } };
     }
+    // 美食、延伸、物品模式：背景裡的人不當主體（除非使用者點選了那個人）
+    const lockedFace = state.lock && state.lock.type === 'face';
+    if (state.sceneMode !== 'auto' && !E.PROFILES[state.sceneMode].faces && !lockedFace) faces = [];
     opts.faces = faces;
     state.lastGray = data;
-    const a = E.analyze(data, opts);
+    let a = E.analyze(data, opts);
+    // 拍攝類型：手動選的直接用；自動模式依判斷結果（有把握才套用）
+    const type = resolveScene(a, isStill);
+    if (state.sceneMode === 'auto' && !E.PROFILES[type].faces && a.subject.kind === 'person' && !lockedFace) {
+      a = E.analyze(data, Object.assign({}, opts, { faces: [] }));
+    }
     // 自動偵測的主體突然跳到很遠的地方：要連續出現約 1 秒才採用，否則沿用原本的主體
     if (!isStill && state.smooth && !a.subject.kind && !state.smooth.subject.kind) {
       const ps = state.smooth.subject;
@@ -1603,7 +1944,7 @@ button { cursor: pointer; }
     }
     state.smooth = a;
     state.analysis = a;
-    const comps = E.suggest(a, { prev: state.prevTargets });
+    const comps = E.suggest(a, { prev: state.prevTargets, type });
     for (const c of comps) state.prevTargets[c.id] = c.pick;
     const now = performance.now();
     // 選中的構圖暫時從清單消失時（分數邊界），2.5 秒內沿用它，不要自動換掉
@@ -1743,13 +2084,82 @@ button { cursor: pointer; }
 
   function selected() { return state.comps.find((c) => c.id === state.selectedId) || state.comps[0]; }
 
+  /*
+   * 自動判斷拍攝類型：
+   *  - 照片：判斷一次
+   *  - 即時：機率做平滑；新類型要連續領先約 1.5 秒才切換，避免一直跳
+   *  - 信心度低於 0.7 時不套用（用一般邏輯），並提示使用者直接選類型
+   *    （依 40 張實拍照片，信心度 ≥ 0.7 的判斷約 67% 正確；見 tools/testset.js eval）
+   */
+  const AUTO_MIN_CONF = 0.7;
+  function resolveScene(a, isStill) {
+    const sc = state.scene;
+    if (state.sceneMode !== 'auto') { setSceneType(state.sceneMode); sc.guess = null; return sc.type; }
+    const r = E.classifyScene(a, window.PhotoriumSceneModel);
+    if (isStill || !sc.ema) sc.ema = Object.assign({}, r.probs);
+    else for (const k of Object.keys(E.SCENE_TYPES)) sc.ema[k] = (sc.ema[k] || 0) * 0.75 + (r.probs[k] || 0) * 0.25;
+    let best = null;
+    for (const k in sc.ema) if (!best || sc.ema[k] > sc.ema[best]) best = k;
+    const conf = best ? sc.ema[best] : 0;
+    if (isStill) { sc.guess = best; sc.conf = conf; }
+    else if (best === sc.guess) { sc.conf = conf; sc.candCount = 0; }
+    else {
+      sc.candCount = sc.cand === best ? sc.candCount + 1 : 1;
+      sc.cand = best;
+      if (!sc.guess || sc.candCount >= 7) { sc.guess = best; sc.conf = conf; sc.candCount = 0; }
+    }
+    setSceneType(sc.guess && sc.conf >= AUTO_MIN_CONF ? sc.guess : 'general');
+    return sc.type;
+  }
+  function setSceneType(t) {
+    const sc = state.scene;
+    if (sc.type === t) return;
+    sc.type = t;
+    // 換類型 → 構圖組合不同，目標重新選
+    state.frozen = null; state.prevTargets = {}; state.lastChipRender = 0; state.okLatched = false;
+    renderTypes();
+  }
+
+  function renderTypes() {
+    const sc = state.scene;
+    for (const b of els.types.children) {
+      const t = b.dataset.type;
+      b.setAttribute('aria-checked', t === state.sceneMode ? 'true' : 'false');
+      if (t === 'auto') {
+        b.textContent = state.sceneMode !== 'auto' ? '自動'
+          : sc.type !== 'general' ? `自動・${E.SCENE_TYPES[sc.type]}` : '自動・未確定';
+      }
+    }
+    const pf = E.PROFILES[sc.type];
+    let tip = pf ? pf.tip : '';
+    if (state.sceneMode === 'auto' && sc.type === 'general') tip = '自動判斷還沒有把握，可以直接選拍攝類型，建議會更準。';
+    els.typeTip.textContent = tip;
+  }
+
+  function setSceneMode(m) {
+    state.sceneMode = m;
+    try { localStorage.setItem('photorium.sceneMode', m); } catch (e) { /* 無法儲存時忽略 */ }
+    state.scene.ema = null; state.scene.guess = null; state.scene.candCount = 0;
+    state.scene.type = null; // 強制重設
+    setSceneType(m === 'auto' ? 'general' : m);
+    renderTypes();
+    if (state.lastGray) analyzeNow(state.source === 'still');
+  }
+  els.types.addEventListener('click', (e) => {
+    const b = e.target.closest('.type');
+    if (b) setSceneMode(b.dataset.type);
+  });
+
   function renderReadout() {
     const a = state.analysis;
     if (!a) return;
     const s = a.subject;
     const hz = a.horizon.valid ? `${a.horizon.angle > 0 ? '+' : ''}${a.horizon.angle.toFixed(1)}°` : '—';
     const who = s.kind === 'person' ? `人臉 ${s.count} · 臉寬 ${(s.faceSize * 100).toFixed(0)}%` : `主體 ${(s.area * 100).toFixed(0)}% · 信心 ${(s.conf * 100).toFixed(0)}`;
-    els.readout.textContent = `${who} · 水平線 ${hz} · 對稱 ${(a.symLR * 100).toFixed(0)}`;
+    const sc = state.scene;
+    const kind = sc.type !== 'general' ? E.SCENE_TYPES[sc.type] : '未分類';
+    const guess = state.sceneMode === 'auto' && sc.guess ? `（猜 ${E.SCENE_TYPES[sc.guess]} ${(sc.conf * 100).toFixed(0)}%）` : '';
+    els.readout.textContent = `${kind}${guess} · ${who} · 水平線 ${hz}`;
   }
 
   function renderChips() {
@@ -2152,6 +2562,9 @@ button { cursor: pointer; }
 
   // ---------- 啟動 ----------
   async function boot() {
+    try { const m = localStorage.getItem('photorium.sceneMode'); if (m && (m === 'auto' || E.SCENE_TYPES[m])) state.sceneMode = m; } catch (e) { /* 忽略 */ }
+    state.scene.type = state.sceneMode === 'auto' ? 'general' : state.sceneMode;
+    renderTypes();
     loadScene(0);
     requestAnimationFrame(frame);
     const ok = await startCamera();
